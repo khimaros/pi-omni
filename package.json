@@ -28,26 +28,28 @@
   "files": [
     "dist",
     "public",
-    "wasm",
+    "wasm/apm/pkg",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc && node -e \"require('fs').chmodSync('dist/bin/pi-omni-web.js', 0o755)\"",
+    "prepack": "npm run build",
     "start": "node dist/bin/pi-omni-web.js",
     "test": "node --test test/*.test.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "engines": {
     "node": ">=20"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "^0.74.0"
   },
   "bundleDependencies": ["pi-omni-apm"],
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0",
     "@ricky0123/vad-web": "^0.0.30",
-    "@types/ws": "^8.18.1",
     "avr-vad": "^1.0.10",
     "onnxruntime-web": "^1.26.0",
     "openai": "^4.67.0",
@@ -55,7 +57,9 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
     "@types/node": "^20.11.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.4.0"
   }
 }
