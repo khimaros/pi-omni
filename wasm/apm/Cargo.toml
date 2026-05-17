@@ -1,0 +1,18 @@
+[package]
+name = "pi-omni-apm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR BSD-3-Clause"
+description = "Thin wasm-bindgen wrapper around aec3 for pi-omni"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aec3 = "0.2"
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

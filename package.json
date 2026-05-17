@@ -1,0 +1,61 @@
+{
+  "name": "@khimaros/pi-omni",
+  "version": "0.1.0",
+  "description": "pi.dev extension: push-to-talk voice mode (STT + TTS via OpenAI-compatible endpoint)",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/khimaros/pi-omni.git"
+  },
+  "homepage": "https://github.com/khimaros/pi-omni#readme",
+  "bugs": {
+    "url": "https://github.com/khimaros/pi-omni/issues"
+  },
+  "type": "module",
+  "main": "dist/extension/index.js",
+  "exports": {
+    ".": "./dist/extension/index.js"
+  },
+  "bin": {
+    "pi-omni-web": "dist/bin/pi-omni-web.js"
+  },
+  "pi": {
+    "extensions": ["dist/extension/index.js"]
+  },
+  "files": [
+    "dist",
+    "public",
+    "wasm",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && node -e \"require('fs').chmodSync('dist/bin/pi-omni-web.js', 0o755)\"",
+    "start": "node dist/bin/pi-omni-web.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "bundleDependencies": ["pi-omni-apm"],
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@ricky0123/vad-web": "^0.0.30",
+    "@types/ws": "^8.18.1",
+    "avr-vad": "^1.0.10",
+    "onnxruntime-web": "^1.26.0",
+    "openai": "^4.67.0",
+    "pi-omni-apm": "file:./wasm/apm/pkg",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}

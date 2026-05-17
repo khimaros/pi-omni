@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+<meta name="theme-color" content="#0a0a0a" />
+<title>pi-omni</title>
+<style>
+  :root {
+    --bg: #0f0d12;
+    --fg: #f0e6f0;
+    --dim: #8a8294;
+    --accent: #a7f3d0;       /* pastel mint — user / listening */
+    --warn:   #fde68a;       /* pastel peach — agent thinking */
+    --speak:  #bfdbfe;       /* pastel sky — assistant speaking */
+    --err:    #fda4af;       /* pastel coral — errors */
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  body {
+    display: flex; flex-direction: column;
+    padding: max(env(safe-area-inset-top), 16px) 16px max(env(safe-area-inset-bottom), 16px);
+  }
+  #status {
+    color: var(--dim);
+    font-size: 13px;
+    text-align: center;
+    min-height: 18px;
+    margin-bottom: 8px;
+  }
+  #orb {
+    flex: 1;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  #orb .dot {
+    width: 140px; height: 140px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 30% 30%, #333, #111 70%);
+    box-shadow: 0 0 0 2px #222 inset, 0 0 40px rgba(0,0,0,0.5);
+    transition: box-shadow 200ms ease-out;
+  }
+  #orb .glyph {
+    font-size: 96px;
+    line-height: 1;
+  }
+  /* State is conveyed by the glow around the (always grey) orb. */
+  body.listening #orb .dot {
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(167,243,208,0.55);
+  }
+  body.transcribing #orb .dot {
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(216,180,254,0.55);
+  }
+  body.thinking #orb .dot {
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(253,230,138,0.55);
+  }
+  body.synthesizing #orb .dot {
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(165,243,252,0.55);
+  }
+  body.speaking #orb .dot {
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(191,219,254,0.6);
+  }
+  body.error #orb .dot {
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(253,164,175,0.6);
+  }
+  #transcript {
+    color: var(--accent);
+    font-size: 14px;
+    text-align: center;
+    min-height: 22px;
+    margin-top: 12px;
+    word-wrap: break-word;
+    opacity: 0.9;
+  }
+  #assistant {
+    color: var(--speak);
+    font-size: 14px;
+    text-align: center;
+    min-height: 60px;
+    margin-top: 8px;
+    word-wrap: break-word;
+    opacity: 0.95;
+  }
+  #start-overlay {
+    position: fixed; inset: 0;
+    background: var(--bg);
+    /* Mirror the body's column flex so #start-orb sits at the same
+       vertical position as #orb behind it — no jump on overlay hide. */
+    display: flex; flex-direction: column;
+    z-index: 10;
+    padding: max(env(safe-area-inset-top), 16px) 16px max(env(safe-area-inset-bottom), 16px);
+  }
+  #start-overlay.hidden { display: none; }
+  /* Placeholders match the heights/margins of #status, #transcript,
+     #assistant so flex:1 #start-orb-slot centers at the same Y as #orb. */
+  #start-overlay .status-slot { min-height: 18px; margin-bottom: 8px; }
+  #start-overlay .orb-slot {
+    flex: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #start-overlay .transcript-slot { min-height: 22px; margin-top: 12px; }
+  #start-overlay .assistant-slot {
+    min-height: 60px; margin-top: 8px;
+    display: flex; flex-direction: column; align-items: center;
+  }
+  #start-orb {
+    cursor: pointer;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+    transition: opacity 120ms;
+  }
+  #start-orb.disabled {
+    opacity: 0.45;
+    cursor: progress;
+  }
+  /* Reuse the main orb styling so the start orb is visually identical
+     (and lines up with the main orb once the overlay hides). */
+  #start-orb .dot {
+    width: 140px; height: 140px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 30% 30%, #333, #111 70%);
+    box-shadow: 0 0 0 2px #222 inset, 0 0 40px rgba(0,0,0,0.5);
+    transition: box-shadow 200ms ease-out;
+  }
+  /* Pure-CSS play triangle — ~60% of the 140px disc, optically centered
+     (a right-pointing triangle's visual center is at 1/3 from the base,
+     so we offset by that amount). Only the triangle animates on click. */
+  #start-orb .glyph {
+    width: 0; height: 0;
+    border-style: solid;
+    border-width: 40px 0 40px 64px;
+    border-color: transparent transparent transparent var(--fg);
+    margin-left: 16px;   /* (triangle width / 4) — visual centroid offset */
+    transition: border-color 200ms ease-out, transform 120ms ease-out;
+  }
+  #start-orb:not(.disabled):active .glyph {
+    transform: scale(0.9);
+  }
+  /* Hover: pastel-mint glow + tinted triangle. Disc and orb position
+     stay put — only the glow changes so the layout doesn't shift. */
+  #start-orb:not(.disabled):hover .dot {
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(167,243,208,0.55);
+  }
+  #start-orb:not(.disabled):hover .glyph {
+    border-left-color: var(--accent);
+  }
+  #start-overlay p {
+    color: var(--dim); margin: 8px 0 0; max-width: 280px; text-align: center;
+    font-size: 13px;
+  }
+  #progress {
+    width: 240px; height: 4px; border-radius: 2px;
+    background: #222; overflow: hidden;
+  }
+  #progress .bar {
+    height: 100%; width: 0; background: var(--accent);
+    transition: width 120ms ease-out;
+  }
+  #progress.hidden { visibility: hidden; }
+</style>
+</head>
+<body>
+  <div id="start-overlay">
+    <div class="status-slot"></div>
+    <div class="orb-slot">
+      <div id="start-orb" class="disabled"><div class="dot"><span class="glyph"></span></div></div>
+    </div>
+    <div class="transcript-slot"></div>
+    <div class="assistant-slot">
+      <div id="progress" class="hidden"><div class="bar"></div></div>
+      <p id="start-hint">downloading voice model…</p>
+    </div>
+  </div>
+  <div id="status">idle</div>
+  <div id="orb"><div class="dot"><span class="glyph"></span></div></div>
+  <div id="transcript"></div>
+  <div id="assistant"></div>
+  <script src="/vendor/ort/ort.min.js"></script>
+  <script src="/vendor/vad-web/bundle.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

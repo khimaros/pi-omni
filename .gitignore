@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.*
+# Rust/WASM build artifacts for wasm/apm/ (the compiled pkg/ is tracked
+# because package.json depends on it via file:).
+wasm/apm/target/

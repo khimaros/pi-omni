@@ -1,0 +1,593 @@
+// pi-omni minimal voice web UI.
+//
+// Flow:
+//   tap-to-start (iOS user-gesture requirement) → MicVAD opens mic w/ AEC/NS/AGC
+//   and runs Silero v5 via onnxruntime-web → on onSpeechEnd, the library hands
+//   us the complete utterance as Float32 @ 16kHz. We int16-encode and ship it
+//   to the server as one binary WS frame between audio_start/audio_end.
+//   → server runs STT → if non-empty: cancels TTS, sends pi.sendUserMessage,
+//     streams TTS PCM back; AudioWorklet plays gaplessly.
+//   → on speech-start during playback: we do NOT cancel TTS locally; server
+//     decides based on STT result.
+
+const startOverlay = document.getElementById("start-overlay");
+const startOrb = document.getElementById("start-orb");
+const startGlyph = startOrb.querySelector(".glyph");
+const statusEl = document.getElementById("status");
+const transcriptEl = document.getElementById("transcript");
+const assistantEl = document.getElementById("assistant");
+const progressEl = document.getElementById("progress");
+const progressBar = progressEl.querySelector(".bar");
+const startHint = document.getElementById("start-hint");
+
+// Pre-warm: kick off the big asset downloads as soon as the page loads so the
+// browser's HTTP cache has them ready when MicVAD.new() asks. We track aggregate
+// progress and only enable "tap to start" once both are in.
+const PREFETCH = [
+  { url: "/vendor/ort/ort-wasm-simd-threaded.wasm", label: "onnx runtime" },
+  { url: "/vendor/vad-web/silero_vad_v5.onnx",       label: "vad model" },
+];
+const prefetchState = PREFETCH.map(() => ({ loaded: 0, total: 0, done: false }));
+
+function updateProgress() {
+  let loaded = 0;
+  let total = 0;
+  let allKnown = true;
+  for (const s of prefetchState) {
+    loaded += s.loaded;
+    if (s.total > 0) total += s.total;
+    else allKnown = false;
+  }
+  if (total > 0) {
+    const pct = Math.min(100, Math.round((loaded / total) * 100));
+    progressBar.style.width = pct + "%";
+    const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+    startHint.textContent = allKnown
+      ? `downloading voice model… ${mb(loaded)} / ${mb(total)} MB`
+      : `downloading voice model… ${mb(loaded)} MB`;
+  }
+  if (prefetchState.every((s) => s.done)) {
+    progressEl.classList.add("hidden");
+    const failures = prefetchState
+      .map((s, i) => (s.failed ? PREFETCH[i] : null))
+      .filter(Boolean);
+    if (failures.length > 0) {
+      // Keep the orb disabled and tell the user *what* failed and *where*
+      // to look — silent 404s on vendor assets are this app's #1 ghost bug.
+      startHint.textContent =
+        `failed to load ${failures.map((f) => f.label).join(", ")} — ` +
+        `check server logs (vendor asset 404s)`;
+      document.body.classList.add("error");
+      // Leave .disabled on the orb; do not auto-start.
+      return;
+    }
+    startHint.textContent = "";
+    startOrb.classList.remove("disabled");
+    prefetchDone = true;
+    maybeAutoStart();
+  }
+}
+
+function maybeAutoStart() {
+  console.log("[autostart] check serverWantsAutoStart=", serverWantsAutoStart,
+              "prefetchDone=", prefetchDone, "started=", started);
+  if (!serverWantsAutoStart || !prefetchDone || started) return;
+  console.log("[autostart] attempting silent start()");
+  // Try silently. iOS Safari and some browsers will refuse without a user
+  // gesture; we fall back to the overlay below.
+  started = true;
+  start()
+    .then(() => {
+      console.log("[autostart] success");
+      startOverlay.classList.add("hidden");
+    })
+    .catch((e) => {
+      console.warn("[autostart] failed:", e?.name, e?.message ?? e);
+      // Auto-start failed (likely missing user gesture). Re-enable manual tap.
+      started = false;
+      startHint.textContent = "";
+    });
+}
+
+async function prefetchOne(i) {
+  const { url } = PREFETCH[i];
+  try {
+    const resp = await fetch(url, { cache: "force-cache" });
+    if (!resp.ok || !resp.body) throw new Error(`${resp.status}`);
+    const lenHeader = resp.headers.get("Content-Length");
+    if (lenHeader) prefetchState[i].total = Number(lenHeader);
+    const reader = resp.body.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      prefetchState[i].loaded += value.byteLength;
+      updateProgress();
+    }
+    prefetchState[i].done = true;
+    updateProgress();
+  } catch (e) {
+    // A prefetch failure (usually 404 on a vendor asset) means MicVAD
+    // initialization will also fail. Surface it in the hint and keep the
+    // orb disabled so the user isn't left tapping a dead button.
+    prefetchState[i].done = true;
+    prefetchState[i].failed = true;
+    console.error(`[prefetch] failed to load ${PREFETCH[i].label} (${url}):`, e);
+    updateProgress();
+  }
+}
+
+// Fail loudly before we even start prefetching if we're on an insecure
+// origin — the audio worklet + getUserMedia both need a secure context, so
+// nothing past the start button will work over plain HTTP.
+if (!window.isSecureContext) {
+  console.error("[start] insecure origin:", location.origin);
+  startHint.textContent =
+    `insecure origin (${location.origin}) — needs HTTPS or localhost. ` +
+    `Tunnel: ssh -L ${location.port}:localhost:${location.port} <host>`;
+  document.body.classList.add("error");
+  progressEl.classList.add("hidden");
+  // Leave .disabled on the orb.
+} else {
+  progressEl.classList.remove("hidden");
+  PREFETCH.forEach((_, i) => prefetchOne(i));
+}
+
+const TARGET_CAPTURE_RATE = 16000;
+
+let ws = null;
+let ttsSampleRate = 24000;
+let playerCtx = null;
+let playerNode = null;
+let micVad = null;
+let speaking = false;
+let arp = null;
+let thinking = false;
+// Server has signaled tts_end (no more PCM coming) but the worklet may
+// still be playing buffered audio. Set true on tts_end, consumed on the
+// next "drained" message from the worklet — that's when we actually
+// leave the speaking phase.
+let ttsServerEnded = false;
+// Mirrors the worklet's hadAudio flag in the inverse direction: true
+// when its playout buffer is empty. Used to handle the race where the
+// worklet drains BEFORE the server emits tts_end (so we don't get a
+// second drained signal).
+let workletEmpty = true;
+let serverWantsAutoStart = false;
+let prefetchDone = false;
+let started = false;
+
+function setStatus(s) { statusEl.textContent = s; }
+function setBodyState(name, on) { document.body.classList.toggle(name, on); }
+function setTranscript(s) { transcriptEl.textContent = s; }
+
+// Single source of truth for the orb glow + status text. The four phases
+// are mutually exclusive; passing `"idle"` clears all of them. Errors and
+// disconnect states are handled separately because they overlay arbitrary
+// text on top of the phase.
+//
+// Note: `thinking` (above) is a SEPARATE flag — it means "agent loop is
+// still active" (true between transcript and agent_end). It can be true
+// while the visible phase is "speaking" (mid-response) or even briefly
+// while in a tool-call gap. The glow shown is whatever phase you pass here.
+const PHASES = ["listening", "transcribing", "thinking", "synthesizing", "speaking"];
+function setPhase(phase) {
+  for (const p of PHASES) setBodyState(p, p === phase);
+  if (phase) setStatus(phase === "idle" ? "ready" : phase);
+}
+
+// Called from either "tts_end" or the worklet "drained" event. Only
+// leaves the speaking phase when BOTH happen — server done sending AND
+// worklet done playing — so the glow lasts until audio is actually
+// heard. No-op if the user already barged in (listening owns the orb).
+function maybeEndSpeaking() {
+  console.log("[tts] maybeEndSpeaking speaking=", speaking,
+              "ttsServerEnded=", ttsServerEnded, "workletEmpty=", workletEmpty);
+  if (!speaking || !ttsServerEnded || !workletEmpty) return;
+  speaking = false;
+  ttsServerEnded = false;
+  if (document.body.classList.contains("listening")) return;
+  if (thinking) setPhase("thinking");
+  else setPhase("idle");
+}
+
+// Cute random-pentatonic arpeggiator played while the LLM is thinking.
+// Quiet, brief notes ducked under any concurrent audio. Stops as soon as
+// the first TTS frame arrives.
+class Arpeggiator {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.timer = null;
+    this.active = false;
+    // C major pentatonic, 4th-5th octaves.
+    this.scale = [
+      261.63, 293.66, 329.63, 392.0, 440.0,
+      523.25, 587.33, 659.25, 783.99,
+    ];
+    // Feedback-delay "reverb": each note feeds a delay line that loops
+    // back into itself at <1 gain so the tail decays naturally.
+    // Master gain — single chokepoint so stop() can silence everything
+    // (dry notes AND the feedback-delay tail) by ramping one node to 0.
+    this.master = ctx.createGain();
+    this.master.gain.value = 1.0;
+    this.master.connect(ctx.destination);
+    this.delay = ctx.createDelay(2.0);
+    this.delay.delayTime.value = 0.22;
+    this.feedback = ctx.createGain();
+    this.feedback.gain.value = 0.55;
+    this.wet = ctx.createGain();
+    this.wet.gain.value = 0.5;
+    this.delay.connect(this.feedback);
+    this.feedback.connect(this.delay);
+    this.delay.connect(this.wet);
+    this.wet.connect(this.master);
+  }
+  start() {
+    if (this.active) return;
+    this.active = true;
+    const now = this.ctx.currentTime;
+    this.master.gain.cancelScheduledValues(now);
+    this.master.gain.setValueAtTime(1.0, now);
+    try { this.master.connect(this.ctx.destination); } catch {}
+    const intervalMs = 180;
+    const tick = () => {
+      if (!this.active) return;
+      this.playNote();
+      this.timer = setTimeout(tick, intervalMs);
+    };
+    tick();
+  }
+  stop() {
+    this.active = false;
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    // Slam master to 0 and disconnect from destination. The disconnect is the
+    // belt-and-suspenders bit: even if a stray automation later moves the
+    // gain, nothing reaches the speakers until start() reconnects.
+    const now = this.ctx.currentTime;
+    this.master.gain.cancelScheduledValues(now);
+    this.master.gain.setValueAtTime(0, now);
+    try { this.master.disconnect(); } catch {}
+  }
+  playNote() {
+    if (this.ctx.state === "suspended") this.ctx.resume().catch(() => {});
+    const now = this.ctx.currentTime;
+    const freq = this.scale[Math.floor(Math.random() * this.scale.length)];
+    const osc = this.ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.value = freq;
+    const env = this.ctx.createGain();
+    env.gain.setValueAtTime(0, now);
+    env.gain.linearRampToValueAtTime(0.08, now + 0.025);
+    env.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
+    osc.connect(env);
+    env.connect(this.master);
+    env.connect(this.delay);
+    osc.start(now);
+    osc.stop(now + 0.65);
+  }
+}
+function setAssistant(s) { assistantEl.textContent = s; }
+function appendAssistant(s) { assistantEl.textContent += s; }
+
+startOrb.addEventListener("click", async () => {
+  console.log("[start] orb clicked, disabled=", startOrb.classList.contains("disabled"),
+              "started=", started, "prefetchDone=", prefetchDone);
+  if (startOrb.classList.contains("disabled") || started) return;
+  startOrb.classList.add("disabled");
+  started = true;
+  try {
+    await start();
+    console.log("[start] start() resolved");
+    startOverlay.classList.add("hidden");
+  } catch (e) {
+    console.error("[start] failed:", e);
+    setStatus(`error: ${e.message ?? e}`);
+    setBodyState("error", true);
+    startOrb.classList.remove("disabled");
+    started = false;
+  }
+});
+
+async function start() {
+  // AudioWorklet + getUserMedia both require a secure context. On plain HTTP
+  // (e.g. http://<vm-ip>:port) AudioContext.audioWorklet is undefined and the
+  // browser silently refuses mic access. Fail fast with a useful message.
+  if (!window.isSecureContext) {
+    throw new Error(
+      `insecure origin (${location.origin}) — pi-omni-web needs HTTPS or ` +
+      `localhost. Tunnel with: ssh -L ${location.port}:localhost:${location.port} <host>`,
+    );
+  }
+  console.log("[start] step 1: AudioContext + worklet");
+  playerCtx = new (window.AudioContext || window.webkitAudioContext)({
+    latencyHint: "interactive",
+  });
+  await playerCtx.audioWorklet.addModule("worklet.js");
+  playerNode = new AudioWorkletNode(playerCtx, "pcm-player");
+  playerNode.connect(playerCtx.destination);
+  playerNode.port.onmessage = (e) => {
+    if (e.data?.type === "drained") {
+      console.log("[tts] worklet drained, ttsServerEnded=", ttsServerEnded);
+      workletEmpty = true;
+      maybeEndSpeaking();
+    }
+  };
+  arp = new Arpeggiator(playerCtx);
+
+  console.log("[start] step 2: WebSocket");
+  await openWs();
+
+  console.log("[start] step 3: initSession");
+  await initSession();
+  console.log("[start] all steps complete");
+}
+
+async function initMic() {
+  // MicVAD (Silero v5 via onnxruntime-web). Library opens its own
+  // getUserMedia + AudioContext. We pass through AEC/NS/AGC constraints
+  // so the browser strips speaker echo before VAD sees the audio.
+  if (micVad) return;
+  if (!window.vad || !window.vad.MicVAD) {
+    throw new Error("vad-web library not loaded");
+  }
+  setStatus("loading VAD model…");
+  micVad = await window.vad.MicVAD.new({
+    model: "v5",
+    baseAssetPath: "/vendor/vad-web/",
+    onnxWASMBasePath: "/vendor/ort/",
+    additionalAudioConstraints: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+    // Mirror her/'s SileroVADAnalyzer params (confidence=0.5, ~500ms start,
+    // ~200ms stop). v5 frame is 512 samples = 32ms.
+    positiveSpeechThreshold: 0.5,
+    negativeSpeechThreshold: 0.35,
+    minSpeechFrames: 16,
+    redemptionFrames: 6,
+    preSpeechPadFrames: 3,
+    onSpeechStart: () => {
+      console.log("[vad] onSpeechStart speaking=", speaking, "thinking=", thinking);
+      // Ignore VAD entirely while the socket is down — we can't send the
+      // utterance anywhere, and starting the arp would leave a "thinking"
+      // sound playing with no turn behind it.
+      if (!ws || ws.readyState !== 1) return;
+      // Barge-in: kill local playback immediately + tell the server to
+      // cancel any in-flight TTS / drop late LLM deltas. If STT comes back
+      // empty we simply don't start a new turn (bot stays quiet).
+      if (speaking) {
+        console.warn("[vad] barge-in during speaking — cancelling TTS");
+        playerNode.port.postMessage({ type: "reset" });
+        speaking = false;
+        ttsServerEnded = false;
+        workletEmpty = true;
+        wsSendJson({ type: "cancel" });
+      }
+      // Quiet the thinking sound so it doesn't sit under the user's voice;
+      // if this turns out to be a misfire, onVADMisfire/empty-STT will
+      // resurrect it (we're still waiting on a pending turn).
+      arp?.stop();
+      setPhase("listening");
+      wsSendJson({ type: "audio_start" });
+    },
+    onSpeechEnd: (audio) => {
+      console.log("[vad] onSpeechEnd speaking=", speaking, "thinking=", thinking);
+      if (!ws || ws.readyState !== 1) return;
+      // audio: Float32Array of the complete utterance @ 16kHz.
+      sendUtterance(audio);
+      setPhase("transcribing");
+      wsSendJson({ type: "audio_end", sampleRate: TARGET_CAPTURE_RATE });
+      // Cute "thinking" sound while we wait for STT → LLM → first TTS frame.
+      // We don't flip `thinking` here because STT might come back empty — we
+      // wait for the server's "transcript" message to commit.
+      arp?.start();
+    },
+    onVADMisfire: () => {
+      console.log("[vad] onVADMisfire speaking=", speaking, "thinking=", thinking);
+      if (!ws || ws.readyState !== 1) return;
+      // Too-short burst — VAD-web emits this instead of onSpeechEnd; we just
+      // drop the audio and roll back UI state. If a prior turn is still
+      // pending, resume the thinking sound we silenced in onSpeechStart.
+      if (speaking) setPhase("speaking");
+      else if (thinking) { setPhase("thinking"); arp?.start(); }
+      else setPhase("idle");
+    },
+  });
+  micVad.start();
+}
+
+let reconnectTimer = null;
+let reconnectDelayMs = 500;
+
+// Tear down all per-session transient state on disconnect. We keep the
+// AudioContext + worklet (creating a new one needs a user gesture on iOS)
+// but flush its buffer; everything else gets reset and is rebuilt on
+// reconnect by initSession().
+function resetSessionState() {
+  if (speaking) {
+    try { playerNode?.port.postMessage({ type: "reset" }); } catch {}
+    speaking = false;
+  }
+  thinking = false;
+  for (const p of PHASES) setBodyState(p, false);
+  arp?.stop();
+  // Drop any pending utterance/transcript UI hints from the dead session.
+  setStatus("reconnecting");
+  // Leave micVad running across reconnects. destroy() would force a fresh
+  // getUserMedia (which needs a user gesture), and pause()/start() can leave
+  // the internal AudioContext suspended on some browsers. Its callbacks send
+  // via wsSendJson which is a no-op while the socket is down; on reconnect
+  // they land on the new socket automatically.
+}
+
+// Re-establish the per-session pieces that resetSessionState() tore down.
+async function initSession() {
+  // micVad is left running across reconnects (see resetSessionState). On
+  // first connect there's no micVad yet, so initialize it here.
+  if (!micVad) await initMic();
+  setPhase("idle");
+}
+
+function openWs(isReconnect = false) {
+  return new Promise((resolve, reject) => {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.binaryType = "arraybuffer";
+    let settled = false;
+    ws.addEventListener("open", () => {
+      reconnectDelayMs = 500;
+      setBodyState("error", false);
+      settled = true;
+      resolve();
+    });
+    ws.addEventListener("error", () => {
+      if (!settled && !isReconnect) {
+        settled = true;
+        reject(new Error("ws connect failed"));
+      }
+    });
+    ws.addEventListener("close", () => {
+      setStatus("reconnecting");
+      setBodyState("error", true);
+      resetSessionState();
+      scheduleReconnect();
+    });
+    ws.addEventListener("message", onWsMessage);
+  });
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  const delay = reconnectDelayMs;
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, 10000); // cap 10s
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    try {
+      await openWs(true);
+      await initSession();
+    } catch {
+      scheduleReconnect();
+    }
+  }, delay);
+}
+
+function onWsMessage(ev) {
+  if (typeof ev.data === "string") {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    handleControl(msg);
+  } else {
+    const i16 = new Int16Array(ev.data);
+    // First PCM frame after a synth/drain gap: audible playback begins
+    // now. Stop the thinking arp and flip from the "synth" glow to
+    // "speaking" (no-ops if we're already in speaking — e.g. mid-stream
+    // between sentences). The listening class is the barge-in case;
+    // don't clobber it.
+    if (workletEmpty) {
+      arp?.stop();
+      if (speaking && !document.body.classList.contains("listening")) {
+        setPhase("speaking");
+      }
+    }
+    workletEmpty = false;
+    playerNode.port.postMessage({ type: "pcm", samples: i16 }, [i16.buffer]);
+  }
+}
+
+function handleControl(msg) {
+  switch (msg.type) {
+    case "hello":
+      ttsSampleRate = msg.ttsSampleRate ?? 24000;
+      playerNode.port.postMessage({ type: "init", sourceRate: ttsSampleRate });
+      serverWantsAutoStart = !!msg.autoStart;
+      if (typeof msg.orbGlyph === "string") {
+        document.querySelector("#orb .glyph").textContent = msg.orbGlyph;
+      }
+      maybeAutoStart();
+      break;
+    case "status":
+      // Empty STT for THIS utterance: server won't commit a turn. Go
+      // back to idle and stop the thinking sound.
+      if (msg.message === "empty transcription") {
+        setPhase("idle");
+        arp?.stop();
+      }
+      // Other status messages are server-side breadcrumbs — don't
+      // overwrite the phase-driven status text.
+      break;
+    case "transcript":
+      setTranscript(msg.text ?? "");
+      // New turn committed — server is about to call pi.sendUserMessage,
+      // so the LLM phase has effectively started.
+      thinking = true;
+      setPhase("thinking");
+      // New turn — clear last reply.
+      setAssistant("");
+      break;
+    case "llm_delta":
+      if (typeof msg.text === "string") appendAssistant(msg.text);
+      break;
+    case "llm_text":
+      // Block-mode (no streaming): full assistant text at end of turn.
+      if (typeof msg.text === "string") setAssistant(msg.text);
+      break;
+    case "tts_start":
+      console.log("[tts] tts_start (synth phase — waiting for first PCM)");
+      speaking = true;
+      ttsServerEnded = false;
+      // The server has only kicked off the TTS HTTP request — in block
+      // (non-sentence-streaming) mode several seconds can pass before
+      // the first PCM frame. Show a distinct "synth" glow until then;
+      // the speaking phase and arp-stop both fire on first PCM below.
+      setPhase("synthesizing");
+      break;
+    case "tts_cancel":
+      console.log("[tts] tts_cancel");
+      // Server committed to a new turn — drop in-flight playback locally.
+      playerNode.port.postMessage({ type: "reset" });
+      speaking = false;
+      ttsServerEnded = false;
+      workletEmpty = true;
+      // Don't change phase here; the new turn's STT/thinking will set it.
+      break;
+    case "tts_end":
+      console.log("[tts] tts_end (server) — waiting for worklet drain");
+      // Mark that the server is done sending PCM. The phase transition
+      // happens on the worklet's "drained" message so the speaking glow
+      // lasts until the audio is actually heard. If the worklet already
+      // drained (rare — short utterance, server is slow to emit tts_end)
+      // we still need to advance now.
+      ttsServerEnded = true;
+      maybeEndSpeaking();
+      break;
+    case "agent_end":
+      thinking = false;
+      if (!speaking) setPhase("idle");
+      break;
+    case "error":
+      thinking = false;
+      for (const p of PHASES) setBodyState(p, false);
+      setBodyState("error", true);
+      setStatus(`error: ${msg.message}`);
+      arp?.stop();
+      break;
+  }
+}
+
+function sendUtterance(f32) {
+  if (!ws || ws.readyState !== 1) return;
+  const i16 = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    let v = Math.round(f32[i] * 32768);
+    if (v > 32767) v = 32767;
+    else if (v < -32768) v = -32768;
+    i16[i] = v;
+  }
+  ws.send(i16.buffer);
+}
+
+function wsSendJson(obj) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify(obj));
+}
