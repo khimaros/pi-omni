@@ -13,6 +13,65 @@
 const startOverlay = document.getElementById("start-overlay");
 const startOrb = document.getElementById("start-orb");
 const startGlyph = startOrb.querySelector(".glyph");
+const orbEl = document.getElementById("orb");
+
+const HOLD_THRESHOLD_MS = 250;
+const PTT_VAD_HANGOVER_MS = 400;
+// "live" — VAD runs continuously; "ptt" — VAD only runs while user holds.
+// Set on first release of #start-orb based on press duration.
+let sessionMode = "pause";
+let pttHeld = false;
+let pressTs = 0;
+
+function setOrbGlyph(el, name) {
+  for (const cls of ["glyph-play", "glyph-wave", "glyph-pause", "glyph-square"]) {
+    el.classList.toggle(cls, cls === `glyph-${name}`);
+  }
+}
+
+// Two-note chime via the existing playerCtx — confirms mic-open / mic-
+// close in PTT. Ascending pair ("ready"), descending pair on release.
+// Uses a small triangle+sine blend with a soft attack/decay so it cuts
+// through but doesn't sound like a system error beep.
+function playChime(reverse) {
+  if (!playerCtx) return;
+  // AudioContext can be created in a suspended state even inside a user
+  // gesture (browser-dependent). resume() is idempotent and async; we
+  // schedule notes on currentTime, which is valid even while resuming.
+  if (playerCtx.state === "suspended") {
+    playerCtx.resume().catch(() => {});
+  }
+  // G5 and C6 — a perfect fourth, clean and unambiguous either way.
+  const notes = reverse ? [1046.5, 783.99] : [783.99, 1046.5];
+  const noteDur = 0.16;
+  const stagger = 0.09;
+  const now = playerCtx.currentTime + 0.005;
+  for (let i = 0; i < notes.length; i++) {
+    const t0 = now + i * stagger;
+    const freq = notes[i];
+    // Triangle for body + sine for a clean fundamental → "chime-y".
+    const oscTri = playerCtx.createOscillator();
+    oscTri.type = "triangle";
+    oscTri.frequency.value = freq;
+    const oscSin = playerCtx.createOscillator();
+    oscSin.type = "sine";
+    oscSin.frequency.value = freq * 2; // octave above for sparkle
+    const g = playerCtx.createGain();
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(0.14, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0005, t0 + noteDur);
+    const gSin = playerCtx.createGain();
+    gSin.gain.value = 0.35;
+    oscTri.connect(g);
+    oscSin.connect(gSin);
+    gSin.connect(g);
+    g.connect(playerCtx.destination);
+    oscTri.start(t0);
+    oscSin.start(t0);
+    oscTri.stop(t0 + noteDur + 0.04);
+    oscSin.stop(t0 + noteDur + 0.04);
+  }
+}
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 const assistantEl = document.getElementById("assistant");
@@ -61,7 +120,7 @@ function updateProgress() {
       // Leave .disabled on the orb; do not auto-start.
       return;
     }
-    startHint.textContent = "";
+    startHint.textContent = "push to talk or click to toggle voice detection";
     startOrb.classList.remove("disabled");
     prefetchDone = true;
     maybeAutoStart();
@@ -79,13 +138,16 @@ function maybeAutoStart() {
   start()
     .then(() => {
       console.log("[autostart] success");
+      sessionMode = "pause";
+      setOrbGlyph(orbEl, "pause");
+      setStatus("paused");
       startOverlay.classList.add("hidden");
     })
     .catch((e) => {
       console.warn("[autostart] failed:", e?.name, e?.message ?? e);
       // Auto-start failed (likely missing user gesture). Re-enable manual tap.
       started = false;
-      startHint.textContent = "";
+      startHint.textContent = "push to talk or click to toggle voice detection";
     });
 }
 
@@ -268,24 +330,185 @@ class Arpeggiator {
 function setAssistant(s) { assistantEl.textContent = s; }
 function appendAssistant(s) { assistantEl.textContent += s; }
 
-startOrb.addEventListener("click", async () => {
-  console.log("[start] orb clicked, disabled=", startOrb.classList.contains("disabled"),
+// Unified state machine. Once the overlay is dismissed, the main orb is
+// always in one of three states; clicks toggle live↔pause, and a hold
+// (from any non-PTT state) enters PTT for the duration of the press,
+// returning to pause on release.
+//
+//   null  → pre-session (overlay still showing)
+//   pause → mic completely off; just listening for the user to do something
+//   live  → MicVAD running continuously, server gets VAD-cut utterances
+//   ptt   → raw mic open, buffering audio; transient (held only)
+let holdTimer = null;
+let startPromise = null;
+
+const orbDot = orbEl.querySelector(".dot");
+
+function setStateGlyph() {
+  if (sessionMode === "pause") setOrbGlyph(orbEl, "pause");
+  else if (sessionMode === "live") setOrbGlyph(orbEl, "wave");
+  else if (sessionMode === "ptt") setOrbGlyph(orbEl, "wave");
+}
+
+async function enterLive() {
+  sessionMode = "live";
+  setStateGlyph();
+  try {
+    await ensureLiveMic();
+  } catch (e) {
+    console.error("[live] mic init failed:", e);
+    setStatus(`mic error: ${e.message ?? e}`);
+    setBodyState("error", true);
+    sessionMode = "pause";
+    setStateGlyph();
+    return;
+  }
+  // VAD load can take a couple of seconds — user may have tapped again
+  // to go back to pause while we were waiting.
+  if (sessionMode !== "live") return;
+  try { micVad?.start(); } catch {}
+  setPhase("idle");
+}
+
+function enterPause() {
+  sessionMode = "pause";
+  setStateGlyph();
+  try { micVad?.pause(); } catch {}
+}
+
+// Called when the hold timer fires (still pressed). Opens the PTT mic,
+// plays the open-chime, and switches to ptt state. If VAD was running
+// (live state) it gets paused for the duration.
+async function enterPtt() {
+  const cameFromLive = sessionMode === "live";
+  sessionMode = "ptt";
+  pttHeld = true;
+  setStateGlyph();
+  setPhase("listening");
+  if (cameFromLive && micVad) { try { micVad.pause(); } catch {} }
+  // Wait just long enough for playerCtx (so the chime is audible) — the
+  // first ever PTT can fire before start() finishes.
+  if (!playerCtx && startPromise) { try { await startPromise; } catch {} }
+  if (!pttHeld) return;
+  playChime(false);
+  try {
+    await ensurePttMic();
+    if (pttCtx.state === "suspended") { try { await pttCtx.resume(); } catch {} }
+  } catch (err) {
+    console.error("[ptt] mic init failed:", err);
+    pttHeld = false;
+    setStatus(`mic error: ${err.message ?? err}`);
+    setBodyState("error", true);
+    enterPause();
+    return;
+  }
+  pttBuffer = [];
+  if (startPromise) { try { await startPromise; } catch {} }
+  if (!pttHeld) return;
+  wsSendJson({ type: "audio_start" });
+}
+
+// Called when the user releases during PTT. Flushes the captured audio
+// as one utterance, plays the close-chime, and returns to pause state.
+async function exitPtt() {
+  pttHeld = false;
+  playChime(true);
+  if (startPromise) { try { await startPromise; } catch { sessionMode = "pause"; setStateGlyph(); return; } }
+  const total = pttBuffer.reduce((n, a) => n + a.length, 0);
+  if (total > 0) {
+    const flat = new Float32Array(total);
+    let off = 0;
+    for (const chunk of pttBuffer) { flat.set(chunk, off); off += chunk.length; }
+    pttBuffer = [];
+    sendUtterance(flat);
+    wsSendJson({ type: "audio_end", sampleRate: TARGET_CAPTURE_RATE });
+    setPhase("transcribing");
+    arp?.start();
+  } else {
+    setPhase("idle");
+  }
+  sessionMode = "pause";
+  setStateGlyph();
+}
+
+// Start orb: same gesture model as the main orb. Tap dismisses the
+// overlay and lands in pause; hold begins PTT immediately and the
+// release goes through exitPtt(), also ending in pause.
+startOrb.addEventListener("pointerdown", (e) => {
+  console.log("[start] pointerdown disabled=", startOrb.classList.contains("disabled"),
               "started=", started, "prefetchDone=", prefetchDone);
   if (startOrb.classList.contains("disabled") || started) return;
+  e.preventDefault();
+  try { startOrb.setPointerCapture(e.pointerId); } catch {}
   startOrb.classList.add("disabled");
   started = true;
-  try {
-    await start();
-    console.log("[start] start() resolved");
-    startOverlay.classList.add("hidden");
-  } catch (e) {
-    console.error("[start] failed:", e);
-    setStatus(`error: ${e.message ?? e}`);
-    setBodyState("error", true);
-    startOrb.classList.remove("disabled");
-    started = false;
-  }
+  holdTimer = setTimeout(() => { holdTimer = null; enterPtt(); setOrbGlyph(startOrb, "wave"); }, HOLD_THRESHOLD_MS);
+  startPromise = start()
+    .then(() => { console.log("[start] start() resolved"); })
+    .catch((err) => {
+      console.error("[start] failed:", err);
+      setStatus(`error: ${err.message ?? err}`);
+      setBodyState("error", true);
+      startOrb.classList.remove("disabled");
+      started = false;
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+      throw err;
+    });
 });
+
+async function onStartOrbRelease() {
+  // Short release → tap → toggle live/pause, same as the main orb.
+  if (holdTimer) {
+    clearTimeout(holdTimer);
+    holdTimer = null;
+    if (sessionMode === "pause") {
+      enterLive().catch((e) => console.error("[live] failed:", e));
+    } else if (sessionMode === "live") {
+      enterPause();
+    }
+    setOrbGlyph(startOrb, "pause");
+    if (startPromise) { try { await startPromise; } catch { return; } }
+    startOverlay.classList.add("hidden");
+    return;
+  }
+  // Hold past threshold → PTT was entered. Finalize it.
+  if (sessionMode === "ptt" && pttHeld) {
+    setOrbGlyph(startOrb, "pause");
+    await exitPtt();
+  }
+  startOverlay.classList.add("hidden");
+}
+startOrb.addEventListener("pointerup", onStartOrbRelease);
+startOrb.addEventListener("pointercancel", onStartOrbRelease);
+
+// Main orb: hold-detection timer starts PTT mid-press; short release =
+// click = toggle live/pause.
+let mainHoldTimer = null;
+orbDot.addEventListener("pointerdown", (e) => {
+  if (!started || sessionMode === "ptt") return;
+  e.preventDefault();
+  try { orbDot.setPointerCapture(e.pointerId); } catch {}
+  mainHoldTimer = setTimeout(() => { mainHoldTimer = null; enterPtt(); }, HOLD_THRESHOLD_MS);
+});
+
+function onMainOrbUp() {
+  if (mainHoldTimer) {
+    clearTimeout(mainHoldTimer);
+    mainHoldTimer = null;
+    // Click → toggle.
+    if (sessionMode === "pause") {
+      enterLive().catch((e) => console.error("[live] failed:", e));
+    } else if (sessionMode === "live") {
+      enterPause();
+    }
+    return;
+  }
+  if (sessionMode === "ptt" && pttHeld) {
+    exitPtt();
+  }
+}
+orbDot.addEventListener("pointerup", onMainOrbUp);
+orbDot.addEventListener("pointercancel", onMainOrbUp);
 
 async function start() {
   // AudioWorklet + getUserMedia both require a secure context. On plain HTTP
@@ -301,6 +524,11 @@ async function start() {
   playerCtx = new (window.AudioContext || window.webkitAudioContext)({
     latencyHint: "interactive",
   });
+  // Some browsers create the context in "suspended" state even inside a
+  // user gesture. Resume now so the first chime (fired before the mic
+  // opens) is actually audible — otherwise oscillators schedule at
+  // currentTime=0 and never play.
+  try { await playerCtx.resume(); } catch {}
   await playerCtx.audioWorklet.addModule("worklet.js");
   playerNode = new AudioWorkletNode(playerCtx, "pcm-player");
   playerNode.connect(playerCtx.destination);
@@ -423,10 +651,56 @@ function resetSessionState() {
 
 // Re-establish the per-session pieces that resetSessionState() tore down.
 async function initSession() {
-  // micVad is left running across reconnects (see resetSessionState). On
-  // first connect there's no micVad yet, so initialize it here.
-  if (!micVad) await initMic();
+  // micVad is only spun up for live mode (it opens its own getUserMedia
+  // and runs Silero continuously; we don't want that overhead during a
+  // pure PTT session). The live-mode entry path calls ensureLiveMic()
+  // explicitly. On reconnect, re-init only if we were already in live.
+  if (sessionMode === "live" && !micVad) await initMic();
   setPhase("idle");
+}
+
+async function ensureLiveMic() {
+  if (!micVad) await initMic();
+}
+
+// Raw PTT capture: a parallel getUserMedia + ScriptProcessor that
+// buffers Float32 frames while the user holds the main orb. Bypasses
+// VAD entirely so utterances of any length get transcribed (MicVAD's
+// minSpeechFrames threshold would drop short presses). Lazy-initialized
+// on first PTT press so non-PTT sessions never touch the mic.
+let pttCtx = null;
+let pttStream = null;
+let pttSource = null;
+let pttProcessor = null;
+let pttBuffer = [];
+
+async function ensurePttMic() {
+  if (pttCtx) return;
+  // 16kHz native: most browsers honor this directly; the few that clamp
+  // to a higher rate would produce wrong-rate PCM, but Chrome/Firefox/
+  // Safari all support 16k since ~2020.
+  pttCtx = new (window.AudioContext || window.webkitAudioContext)({
+    sampleRate: TARGET_CAPTURE_RATE,
+  });
+  pttStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+  });
+  pttSource = pttCtx.createMediaStreamSource(pttStream);
+  // ScriptProcessor is deprecated but universally available; for the
+  // brief PTT capture windows the main-thread cost is negligible.
+  pttProcessor = pttCtx.createScriptProcessor(2048, 1, 1);
+  pttProcessor.onaudioprocess = (e) => {
+    if (!pttHeld) return;
+    // The input Float32Array is reused by the audio engine — copy.
+    pttBuffer.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  };
+  pttSource.connect(pttProcessor);
+  pttProcessor.connect(pttCtx.destination);
 }
 
 function openWs(isReconnect = false) {
@@ -501,7 +775,10 @@ function handleControl(msg) {
       ttsSampleRate = msg.ttsSampleRate ?? 24000;
       playerNode.port.postMessage({ type: "init", sourceRate: ttsSampleRate });
       serverWantsAutoStart = !!msg.autoStart;
-      if (typeof msg.orbGlyph === "string") {
+      if (typeof msg.orbGlyph === "string" && msg.orbGlyph !== "") {
+        // Server-configured text override: drop the CSS-glyph children
+        // and let raw text fill the slot instead.
+        orbEl.classList.remove("orb-glyph-css", "glyph-play", "glyph-wave", "glyph-pause", "glyph-square");
         document.querySelector("#orb .glyph").textContent = msg.orbGlyph;
       }
       maybeAutoStart();
