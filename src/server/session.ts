@@ -106,7 +106,10 @@ export class WebSession {
     if (!this.deps.cfg.ttsStreamSentences) return;
     for (const sentence of this.chunker.push(delta)) {
       const s = sanitizeForSpeech(sentence);
-      if (s) this.tts.enqueue(s);
+      if (s) {
+        this.log(`tts enqueue (stream): ${JSON.stringify(s.slice(0, 80))}`);
+        this.tts.enqueue(s);
+      }
     }
   }
 
@@ -222,7 +225,19 @@ export class WebSession {
     }
   }
 
-  private onTtsPhase(phase: TtsPhase, _info: TtsPhaseInfo): void {
+  private onTtsPhase(phase: TtsPhase, info: TtsPhaseInfo): void {
+    // Log every phase change so silent TTS failures are visible in journalctl.
+    // Includes bytes/ttfb/exit on the phases where they're populated.
+    const parts: string[] = [`tts phase=${phase}`];
+    if (info.text != null) parts.push(`text=${JSON.stringify(info.text.slice(0, 80))}`);
+    if (info.queued != null) parts.push(`queued=${info.queued}`);
+    if (info.bytes != null) parts.push(`bytes=${info.bytes}`);
+    if (info.contentType != null) parts.push(`ct=${info.contentType}`);
+    if (info.ttfbMs != null) parts.push(`ttfb=${info.ttfbMs}ms`);
+    if (info.exitCode != null) parts.push(`exit=${info.exitCode}`);
+    if (info.signal != null) parts.push(`sig=${info.signal}`);
+    if (info.ok != null) parts.push(`ok=${info.ok}`);
+    this.log(parts.join(" "));
     switch (phase) {
       case "synth_start":
         this.sendJson({ type: "tts_start" });

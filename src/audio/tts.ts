@@ -340,6 +340,58 @@ export class TtsPlayer {
     let ttfbMs: number | undefined;
     const startedAt = Date.now();
 
+    // Older OpenAI TTS models (tts-1, tts-1-hd) ignore stream_format and just
+    // stream raw PCM with content-type "audio/pcm". The SSE parser below
+    // would silently drop every byte. Detect that and pipe the body straight
+    // through to the player instead.
+    const isSse = (contentType ?? "").includes("text/event-stream");
+    if (!isSse) {
+      const reader = resp.body.getReader();
+      // S16_LE = 2 bytes/sample. Fetch chunks aren't aligned to sample
+      // boundaries, so carry any trailing odd byte forward; otherwise the
+      // next chunk would be byte-shifted and the audio comes out scrambled.
+      let carry: Buffer | null = null;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (this.cancelled) break;
+          if (!value || value.length === 0) continue;
+          let pcm = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+          if (carry) {
+            pcm = Buffer.concat([carry, pcm]);
+            carry = null;
+          }
+          if (pcm.length % 2 === 1) {
+            carry = pcm.subarray(pcm.length - 1);
+            pcm = pcm.subarray(0, pcm.length - 1);
+          }
+          if (pcm.length === 0) continue;
+          totalBytes += pcm.length;
+          events += 1;
+          if (!firstPcm) {
+            firstPcm = true;
+            ttfbMs = Date.now() - startedAt;
+            this.onPhase("play_start", { text, queued, ttfbMs });
+          }
+          try {
+            player.proc.stdin?.write(pcm);
+          } catch {}
+          try {
+            this.opts.onPcm?.(pcm);
+          } catch {}
+        }
+      } catch (e) {
+        if (!this.cancelled) {
+          this.opts.logger?.(
+            `tts: raw stream read error: ${(e as Error).message}`,
+            "warning",
+          );
+        }
+      }
+      return { bytes: totalBytes, contentType, events, ttfbMs, firstPcm };
+    }
+
     const dispatch = (eventName: string | null, dataLines: string[]): void => {
       if (!dataLines.length && eventName === null) return;
       const name = eventName || "message";
