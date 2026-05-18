@@ -10,10 +10,8 @@
     --bg: #0f0d12;
     --fg: #f0e6f0;
     --dim: #8a8294;
-    --accent: #a7f3d0;       /* pastel mint — user / listening */
-    --warn:   #fde68a;       /* pastel peach — agent thinking */
-    --speak:  #bfdbfe;       /* pastel sky — assistant speaking */
-    --err:    #fda4af;       /* pastel coral — errors */
+    --agent: #a7f3d0;       /* pastel mint — assistant / speaking */
+    --user:  #bfdbfe;       /* pastel sky — user / listening + recording */
   }
   * { box-sizing: border-box; }
   html, body {
@@ -65,7 +63,9 @@
     justify-content: center;
     transition: transform 120ms ease-out;
   }
-  .orb-glyph-css:active:not(.disabled) .glyph { transform: scale(0.9); }
+  /* Scope :active to the .dot — #orb has flex:1 and would otherwise scale
+     the glyph on any mouse-down across the whole page-tall area. */
+  .orb-glyph-css:not(.disabled) .dot:active .glyph { transform: scale(0.9); }
   .orb-glyph-css .glyph .g { display: none; }
   .orb-glyph-css.glyph-play   .glyph .g-play   { display: block; }
   .orb-glyph-css.glyph-wave   .glyph .g-wave   { display: flex; }
@@ -80,15 +80,34 @@
     margin-left: 16px;
     transition: border-color 200ms ease-out;
   }
-  /* Waveform: five vertical bars in a symmetric meter shape. */
+  /* Waveform: five vertical bars in a symmetric meter shape. The waveform
+     is the *only* glyph that's actually rendered now — the play/pause/
+     square spans are kept for back-compat with the server-side orbGlyph
+     override path (which strips orb-glyph-css and writes raw text). */
   .orb-glyph-css .glyph .g-wave {
     align-items: center; justify-content: center;
     gap: 8px; height: 80px;
   }
   .orb-glyph-css .glyph .g-wave i {
     display: block; width: 8px; border-radius: 4px;
-    background: var(--fg);
+    background: var(--dim);
     transition: background 200ms ease-out;
+  }
+  /* Active (mic open — live or PTT): light up the bars in the same blue
+     used for the listening glow. Hover always toggles to the *other*
+     state, so the affordance is meaningful in both directions: hovering
+     an idle orb → blue (you're about to enable); hovering an active orb
+     → dim (you're about to mute). Hover is scoped to .dot so the effect
+     only fires inside the visible disc — #orb is flex:1 and otherwise
+     would trigger from anywhere in the layout column. */
+  body.mic-on .orb-glyph-css .glyph .g-wave i,
+  body:not(.mic-on) #orb .dot:hover .glyph .g-wave i,
+  body:not(.mic-on) #start-orb:not(.disabled) .dot:hover .glyph .g-wave i {
+    background: var(--user);
+  }
+  body.mic-on #orb .dot:hover .glyph .g-wave i,
+  body.mic-on #start-orb:not(.disabled) .dot:hover .glyph .g-wave i {
+    background: var(--dim);
   }
   .orb-glyph-css .glyph .g-wave i:nth-child(1),
   .orb-glyph-css .glyph .g-wave i:nth-child(5) { height: 28px; }
@@ -101,7 +120,7 @@
     gap: 16px; height: 80px;
   }
   .orb-glyph-css .glyph .g-pause i {
-    display: block; width: 18px; height: 80px;
+    display: block; width: 13px; height: 80px;
     border-radius: 4px; background: var(--fg);
     transition: background 200ms ease-out;
   }
@@ -111,9 +130,16 @@
     background: var(--fg);
     transition: background 200ms ease-out;
   }
-  /* State is conveyed by the glow around the (always grey) orb. */
+  /* State is conveyed by the glow around the (always grey) orb. Listening
+     is a soft neutral white — "I'm here, mic is open" — deliberately
+     muted so it doesn't compete with the active states. Recording is the
+     saturated user/sky blue: capturing your voice now. Speaking wears the
+     pastel mint that signals "assistant talking". */
   body.listening #orb .dot {
-    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(167,243,208,0.55);
+    box-shadow: 0 0 0 2px #222 inset, 0 0 50px 2px rgba(240,240,250,0.4);
+  }
+  body.recording #orb .dot {
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 6px rgba(191,219,254,0.85);
   }
   body.transcribing #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(216,180,254,0.55);
@@ -125,13 +151,21 @@
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(165,243,252,0.55);
   }
   body.speaking #orb .dot {
-    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(191,219,254,0.6);
+    box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(167,243,208,0.55);
   }
   body.error #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(253,164,175,0.6);
   }
+  /* While the WS is down both orbs ignore input (handlers early-return on
+     body.reconnecting); the dim + progress cursor signals that. */
+  body.reconnecting #orb .dot,
+  body.reconnecting #start-orb .dot {
+    opacity: 0.45;
+    cursor: progress;
+    pointer-events: none;
+  }
   #transcript {
-    color: var(--accent);
+    color: var(--user);
     font-size: 14px;
     text-align: center;
     min-height: 22px;
@@ -140,7 +174,7 @@
     opacity: 0.9;
   }
   #assistant {
-    color: var(--speak);
+    color: var(--agent);
     font-size: 14px;
     text-align: center;
     min-height: 60px;
@@ -192,14 +226,7 @@
     box-shadow: 0 0 0 2px #222 inset, 0 0 40px rgba(0,0,0,0.5);
     transition: box-shadow 200ms ease-out;
   }
-  /* Hover: tint just the glyph — no box-shadow change on the disc so
-     the orb stays visually still and the only feedback is the icon. */
-  #start-orb:not(.disabled):hover .glyph .g-play  { border-left-color: var(--accent); }
-  #orb:hover .glyph .g-wave i, #orb:hover .glyph .g-pause i,
-  #start-orb:not(.disabled):hover .glyph .g-wave i,
-  #start-orb:not(.disabled):hover .glyph .g-pause i { background: var(--accent); }
-  #orb:hover .glyph .g-square,
-  #start-orb:not(.disabled):hover .glyph .g-square { background: var(--accent); }
+  /* Hover tinting lives in the .g-wave i rule above (only glyph in use). */
   #start-overlay p {
     color: var(--dim); margin: 8px 0 0; max-width: 280px; text-align: center;
     font-size: 13px;
@@ -209,7 +236,7 @@
     background: #222; overflow: hidden;
   }
   #progress .bar {
-    height: 100%; width: 0; background: var(--accent);
+    height: 100%; width: 0; background: var(--agent);
     transition: width 120ms ease-out;
   }
   #progress.hidden { visibility: hidden; }
@@ -219,7 +246,7 @@
   <div id="start-overlay">
     <div class="status-slot"></div>
     <div class="orb-slot">
-      <div id="start-orb" class="disabled orb-glyph-css glyph-pause"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
+      <div id="start-orb" class="disabled orb-glyph-css glyph-wave"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
     </div>
     <div class="transcript-slot"></div>
     <div class="assistant-slot">
@@ -227,8 +254,8 @@
       <p id="start-hint">downloading voice model…</p>
     </div>
   </div>
-  <div id="status">idle</div>
-  <div id="orb" class="orb-glyph-css glyph-pause"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
+  <div id="status">paused</div>
+  <div id="orb" class="orb-glyph-css glyph-wave"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
   <div id="transcript"></div>
   <div id="assistant"></div>
   <script src="/vendor/ort/ort.min.js"></script>

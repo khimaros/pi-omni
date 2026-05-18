@@ -1,51 +1,76 @@
 // pi-omni minimal voice web UI.
 //
 // Flow:
-//   tap-to-start (iOS user-gesture requirement) → MicVAD opens mic w/ AEC/NS/AGC
-//   and runs Silero v5 via onnxruntime-web → on onSpeechEnd, the library hands
-//   us the complete utterance as Float32 @ 16kHz. We int16-encode and ship it
-//   to the server as one binary WS frame between audio_start/audio_end.
+//   tap-to-start (iOS user-gesture requirement) → either a quick tap toggles
+//   live mode (MicVAD opens mic w/ AEC/NS/AGC and runs Silero v5 via
+//   onnxruntime-web) or a hold enters PTT (raw mic via ScriptProcessor).
+//   In live, onSpeechEnd hands us the complete utterance as Float32 @ 16kHz;
+//   in PTT, the buffered frames are concatenated on release. Either way we
+//   int16-encode and ship one binary WS frame between audio_start/audio_end.
 //   → server runs STT → if non-empty: cancels TTS, sends pi.sendUserMessage,
 //     streams TTS PCM back; AudioWorklet plays gaplessly.
-//   → on speech-start during playback: we do NOT cancel TTS locally; server
-//     decides based on STT result.
+//   → on speech-start during playback: we cancel local playback immediately
+//     and tell the server to drop the in-flight turn.
 
 const startOverlay = document.getElementById("start-overlay");
 const startOrb = document.getElementById("start-orb");
-const startGlyph = startOrb.querySelector(".glyph");
 const orbEl = document.getElementById("orb");
 
+// Tunable UX timings (ms). Centralized so they're easy to adjust.
+//   HOLD_THRESHOLD_MS    — orb-hold duration that promotes a tap to PTT.
+//   CHIME_TAIL_PAUSE_MS  — silence inserted after a chime finishes so the
+//                          following side-effect (audio_start, arp, phase
+//                          flip) doesn't step on the chime tail.
 const HOLD_THRESHOLD_MS = 250;
-const PTT_VAD_HANGOVER_MS = 400;
+const CHIME_TAIL_PAUSE_MS = 200;
+// Wait after stopping the mic before the next audio output can play
+// cleanly. micVad.pause() / track.stop() return as soon as JS marks the
+// tracks dead, but the OS audio-routing reconfigure continues
+// asynchronously — playing anything during that window clips the onset.
+const MIC_OFF_SETTLE_MS = 120;
 // "live" — VAD runs continuously; "ptt" — VAD only runs while user holds.
 // Set on first release of #start-orb based on press duration.
 let sessionMode = "pause";
 let pttHeld = false;
-let pressTs = 0;
 
-function setOrbGlyph(el, name) {
-  for (const cls of ["glyph-play", "glyph-wave", "glyph-pause", "glyph-square"]) {
-    el.classList.toggle(cls, cls === `glyph-${name}`);
-  }
+// Both orbs always render the waveform glyph. The bar color is driven by
+// CSS off `body.mic-on` (set in applySessionMode) + :hover.
+function setMicOn(on) {
+  document.body.classList.toggle("mic-on", on);
 }
 
 // Two-note chime via the existing playerCtx — confirms mic-open / mic-
 // close in PTT. Ascending pair ("ready"), descending pair on release.
 // Uses a small triangle+sine blend with a soft attack/decay so it cuts
 // through but doesn't sound like a system error beep.
-function playChime(reverse) {
+// Returns a promise that resolves when the chime has finished playing,
+// so callers can serialize against it (e.g. don't start recording until
+// the open-chime is done).
+async function playChime(reverse) {
   if (!playerCtx) return;
-  // AudioContext can be created in a suspended state even inside a user
-  // gesture (browser-dependent). resume() is idempotent and async; we
-  // schedule notes on currentTime, which is valid even while resuming.
+  // AudioContext can be suspended either because it was just created or
+  // because the browser auto-suspended it after a quiet period. Either
+  // way, await the resume — scheduling notes on currentTime while the
+  // context is still ramping up clips the chime's onset.
   if (playerCtx.state === "suspended") {
-    playerCtx.resume().catch(() => {});
+    try { await playerCtx.resume(); } catch {}
   }
-  // G5 and C6 — a perfect fourth, clean and unambiguous either way.
+  // If the arpeggio is running (e.g. user pauses while the LLM is
+  // thinking), blend the chime into its mix: route through the arp's
+  // master + feedback-delay reverb so the chime sits in the same acoustic
+  // space, and drop the volume so the arp stays audible underneath.
+  const blend = arp?.active === true;
+  const dest = blend ? arp.master : playerCtx.destination;
+  const reverbSend = blend ? arp.delay : null;
+  const peakGain = blend ? 0.10 : 0.22;
+  const sineGain = blend ? 0.4 : 0.5;
+  // G5 and C6 — a perfect fourth, both in C-major pentatonic so the
+  // chime sits in key with the arp when blended.
   const notes = reverse ? [1046.5, 783.99] : [783.99, 1046.5];
   const noteDur = 0.16;
   const stagger = 0.09;
-  const now = playerCtx.currentTime + 0.005;
+  const leadSec = 0.005;
+  const now = playerCtx.currentTime + leadSec;
   for (let i = 0; i < notes.length; i++) {
     const t0 = now + i * stagger;
     const freq = notes[i];
@@ -58,19 +83,23 @@ function playChime(reverse) {
     oscSin.frequency.value = freq * 2; // octave above for sparkle
     const g = playerCtx.createGain();
     g.gain.setValueAtTime(0, t0);
-    g.gain.linearRampToValueAtTime(0.14, t0 + 0.012);
+    g.gain.linearRampToValueAtTime(peakGain, t0 + 0.012);
     g.gain.exponentialRampToValueAtTime(0.0005, t0 + noteDur);
     const gSin = playerCtx.createGain();
-    gSin.gain.value = 0.35;
+    gSin.gain.value = sineGain;
     oscTri.connect(g);
     oscSin.connect(gSin);
     gSin.connect(g);
-    g.connect(playerCtx.destination);
+    g.connect(dest);
+    if (reverbSend) g.connect(reverbSend);
     oscTri.start(t0);
     oscSin.start(t0);
     oscTri.stop(t0 + noteDur + 0.04);
     oscSin.stop(t0 + noteDur + 0.04);
   }
+  // Last note ends at: leadSec + (notes.length-1)*stagger + noteDur + 0.04.
+  const totalSec = leadSec + (notes.length - 1) * stagger + noteDur + 0.04;
+  return new Promise((r) => setTimeout(r, Math.ceil(totalSec * 1000)));
 }
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
@@ -120,7 +149,7 @@ function updateProgress() {
       // Leave .disabled on the orb; do not auto-start.
       return;
     }
-    startHint.textContent = "push to talk or click to toggle voice detection";
+    startHint.textContent = "push to talk or tap to toggle voice detection";
     startOrb.classList.remove("disabled");
     prefetchDone = true;
     maybeAutoStart();
@@ -139,15 +168,14 @@ function maybeAutoStart() {
     .then(() => {
       console.log("[autostart] success");
       sessionMode = "pause";
-      setOrbGlyph(orbEl, "pause");
-      setStatus("paused");
+      applySessionMode();
       startOverlay.classList.add("hidden");
     })
     .catch((e) => {
       console.warn("[autostart] failed:", e?.name, e?.message ?? e);
       // Auto-start failed (likely missing user gesture). Re-enable manual tap.
       started = false;
-      startHint.textContent = "push to talk or click to toggle voice detection";
+      startHint.textContent = "push to talk or tap to toggle voice detection";
     });
 }
 
@@ -201,6 +229,11 @@ let ttsSampleRate = 24000;
 let playerCtx = null;
 let playerNode = null;
 let micVad = null;
+// Parallel buffer of VAD-processed frames while a speech segment is in
+// progress, so that enterPause() can flush a partial utterance to the
+// server if the user pauses mid-sentence.
+let vadSpeaking = false;
+let vadBuffer = [];
 let speaking = false;
 let arp = null;
 let thinking = false;
@@ -222,19 +255,68 @@ function setStatus(s) { statusEl.textContent = s; }
 function setBodyState(name, on) { document.body.classList.toggle(name, on); }
 function setTranscript(s) { transcriptEl.textContent = s; }
 
-// Single source of truth for the orb glow + status text. The four phases
-// are mutually exclusive; passing `"idle"` clears all of them. Errors and
-// disconnect states are handled separately because they overlay arbitrary
-// text on top of the phase.
+// Single source of truth for the orb glow + status text. The phases below
+// are mutually exclusive; passing `"paused"` clears all glows (it's the
+// resting state in pause mode and has no body class of its own). Errors
+// and disconnect states are handled separately because they overlay
+// arbitrary text on top of the phase.
 //
 // Note: `thinking` (above) is a SEPARATE flag — it means "agent loop is
 // still active" (true between transcript and agent_end). It can be true
 // while the visible phase is "speaking" (mid-response) or even briefly
 // while in a tool-call gap. The glow shown is whatever phase you pass here.
-const PHASES = ["listening", "transcribing", "thinking", "synthesizing", "speaking"];
+const PHASES = ["listening", "recording", "transcribing", "thinking", "synthesizing", "speaking"];
+// Phases during which the "thinking" arpeggio plays — entering any of them
+// from a non-arp phase starts it, leaving the set stops it.
+const ARP_PHASES = new Set(["transcribing", "thinking", "synthesizing"]);
+// Phase machine for the LLM/audio pipeline:
+//   paused → listening → recording → transcribing → thinking →
+//   synthesizing → speaking → listening (live) / paused (pause).
+// "listening" is the live-mode resting state (mic open, no voice);
+// "recording" fires when VAD picks up speech or while PTT is held.
+//
+// Chimes are NOT driven from here — they're tied to user-driven session
+// mode transitions (pause ↔ live ↔ ptt) and live alongside those handlers
+// so they can be awaited synchronously before the next side-effect.
+let prevPhase = null;
 function setPhase(phase) {
   for (const p of PHASES) setBodyState(p, p === phase);
-  if (phase) setStatus(phase === "idle" ? "ready" : phase);
+  const prev = prevPhase;
+  prevPhase = phase;
+  refreshStatus();
+  if (prev === phase) return;
+  const wasArp = ARP_PHASES.has(prev);
+  const isArp = ARP_PHASES.has(phase);
+  if (!wasArp && isArp) arp?.start();
+  else if (wasArp && !isArp) arp?.stop();
+}
+
+// The resting phase depends on session mode: in live the mic is always
+// open so the resting state is "listening"; in pause everything is off
+// and we show "paused". Used after any flow returns to baseline (utterance
+// finished with no LLM reply, TTS done, etc). PTT never reaches here —
+// its handlers (enterPtt/exitPtt) own the phase explicitly.
+function restingPhase() {
+  return sessionMode === "live" ? "listening" : "paused";
+}
+
+// Status text mirrors the current phase 1:1 — phase names ARE the
+// user-visible labels. Called from setPhase (phase change) and
+// applySessionMode (sessionMode change, which only matters if no phase
+// has been set yet — e.g. immediately after autostart).
+function refreshStatus() {
+  setStatus(prevPhase || "paused");
+}
+
+// Plays a chime and resolves after the chime tail has cleared + a short
+// pause, so callers can serialize follow-ups (audio_start, the next phase
+// transition, the thinking arp) behind the cue. Waits for the audio graph
+// to be up first — otherwise the very first chime after a cold refresh
+// can be partially garbled.
+async function playChimeAndPause(reverse) {
+  if (startPromise) { try { await startPromise; } catch { return; } }
+  await playChime(reverse);
+  await new Promise((r) => setTimeout(r, CHIME_TAIL_PAUSE_MS));
 }
 
 // Called from either "tts_end" or the worklet "drained" event. Only
@@ -247,14 +329,15 @@ function maybeEndSpeaking() {
   if (!speaking || !ttsServerEnded || !workletEmpty) return;
   speaking = false;
   ttsServerEnded = false;
-  if (document.body.classList.contains("listening")) return;
+  // If VAD barge-in already moved us to recording, leave it alone.
+  if (document.body.classList.contains("recording")) return;
   if (thinking) setPhase("thinking");
-  else setPhase("idle");
+  else setPhase(restingPhase());
 }
 
 // Cute random-pentatonic arpeggiator played while the LLM is thinking.
-// Quiet, brief notes ducked under any concurrent audio. Stops as soon as
-// the first TTS frame arrives.
+// Quiet, brief notes ducked under any concurrent audio. Lifecycle is
+// driven by setPhase via ARP_PHASES.
 class Arpeggiator {
   constructor(ctx) {
     this.ctx = ctx;
@@ -331,11 +414,11 @@ function setAssistant(s) { assistantEl.textContent = s; }
 function appendAssistant(s) { assistantEl.textContent += s; }
 
 // Unified state machine. Once the overlay is dismissed, the main orb is
-// always in one of three states; clicks toggle live↔pause, and a hold
-// (from any non-PTT state) enters PTT for the duration of the press,
-// returning to pause on release.
+// always in one of three session modes; clicks toggle live↔pause, and a
+// hold (from any non-PTT mode) enters PTT for the duration of the press,
+// returning to pause on release. Pre-overlay-dismiss, sessionMode is
+// already "pause" — the started flag is what gates user interaction.
 //
-//   null  → pre-session (overlay still showing)
 //   pause → mic completely off; just listening for the user to do something
 //   live  → MicVAD running continuously, server gets VAD-cut utterances
 //   ptt   → raw mic open, buffering audio; transient (held only)
@@ -344,15 +427,23 @@ let startPromise = null;
 
 const orbDot = orbEl.querySelector(".dot");
 
-function setStateGlyph() {
-  if (sessionMode === "pause") setOrbGlyph(orbEl, "pause");
-  else if (sessionMode === "live") setOrbGlyph(orbEl, "wave");
-  else if (sessionMode === "ptt") setOrbGlyph(orbEl, "wave");
+// Syncs the UI to the current sessionMode: toggles body.mic-on (which
+// drives the active-wave bar color in CSS) and refreshes the status text.
+// Call after every sessionMode mutation.
+function applySessionMode() {
+  setMicOn(sessionMode === "live" || sessionMode === "ptt");
+  refreshStatus();
 }
 
 async function enterLive() {
   sessionMode = "live";
-  setStateGlyph();
+  applySessionMode();
+  // Chime first, mic second. Running getUserMedia in parallel with the
+  // chime causes the audio device to reconfigure mid-chime on some
+  // browsers, clipping the onset. Serializing also keeps the order
+  // intuitive: cue plays → mic opens → ready to listen.
+  await playChimeAndPause(false);
+  if (sessionMode !== "live") return;
   try {
     await ensureLiveMic();
   } catch (e) {
@@ -360,37 +451,75 @@ async function enterLive() {
     setStatus(`mic error: ${e.message ?? e}`);
     setBodyState("error", true);
     sessionMode = "pause";
-    setStateGlyph();
+    applySessionMode();
     return;
   }
-  // VAD load can take a couple of seconds — user may have tapped again
-  // to go back to pause while we were waiting.
   if (sessionMode !== "live") return;
-  try { micVad?.start(); } catch {}
-  setPhase("idle");
+  setPhase("listening");
 }
 
-function enterPause() {
+async function enterPause() {
+  // If the user was mid-utterance when they paused, flush what we've
+  // captured so the turn can complete instead of getting silently dropped.
+  // The leading consonant may be slightly clipped — we don't include the
+  // VAD pre-speech pad here — but the bulk of the utterance survives.
+  let nextPhase = "paused";
+  if (vadSpeaking && vadBuffer.length > 0 && ws?.readyState === 1) {
+    const total = vadBuffer.reduce((n, a) => n + a.length, 0);
+    const flat = new Float32Array(total);
+    let off = 0;
+    for (const c of vadBuffer) { flat.set(c, off); off += c.length; }
+    sendUtterance(flat);
+    wsSendJson({ type: "audio_end", sampleRate: TARGET_CAPTURE_RATE });
+    nextPhase = "transcribing";
+  }
   sessionMode = "pause";
-  setStateGlyph();
-  try { micVad?.pause(); } catch {}
+  applySessionMode();
+  // Clear the prior listening/recording glow immediately so it doesn't
+  // bleed through the close chime. Flip to "transcribing" (which starts
+  // the arp) only AFTER the chime is done — audio_end above already
+  // kicked off server-side STT in parallel.
+  setPhase("paused");
+  await releaseLiveMic();
+  await playChimeAndPause(true);
+  // Only advance to "transcribing" if the server hasn't already moved us
+  // past it. A fast STT+LLM+TTS round-trip can land transcript/tts_start/
+  // speaking before the chime finishes; setting transcribing now would
+  // clobber that and restart the arp under live TTS audio.
+  if (nextPhase !== "paused" && prevPhase === "paused") setPhase(nextPhase);
 }
 
-// Called when the hold timer fires (still pressed). Opens the PTT mic,
-// plays the open-chime, and switches to ptt state. If VAD was running
-// (live state) it gets paused for the duration.
+async function releaseLiveMic() {
+  if (!micVad) return;
+  // pause() stops the mic tracks (so the browser drops the recording
+  // indicator) but keeps the worker, model, and AudioContext loaded —
+  // resuming via start() is fast and never re-downloads the model.
+  try { await micVad.pause(); } catch {}
+  vadSpeaking = false;
+  vadBuffer = [];
+  await new Promise((r) => setTimeout(r, MIC_OFF_SETTLE_MS));
+}
+
+// Called when the hold timer fires (still pressed). Opens the PTT mic and
+// switches to ptt state. The open-chime + mic-open run in parallel, but
+// audio_start is held off until both complete so the chime can't bleed
+// into the captured utterance. If VAD was running (live state) it gets
+// released for the duration.
 async function enterPtt() {
-  const cameFromLive = sessionMode === "live";
   sessionMode = "ptt";
   pttHeld = true;
-  setStateGlyph();
-  setPhase("listening");
-  if (cameFromLive && micVad) { try { micVad.pause(); } catch {} }
-  // Wait just long enough for playerCtx (so the chime is audible) — the
-  // first ever PTT can fire before start() finishes.
-  if (!playerCtx && startPromise) { try { await startPromise; } catch {} }
+  applySessionMode();
+  setPhase("recording");
+  // If this is the first PTT (start-orb path), the overlay is still
+  // covering the main orb — hide it now so the recording glow is visible
+  // while the user is still holding, not just after they release.
+  startOverlay.classList.add("hidden");
+  releaseLiveMic();
+  if (startPromise) { try { await startPromise; } catch {} }
   if (!pttHeld) return;
-  playChime(false);
+  // Chime first, mic second — see comment in enterLive for rationale.
+  await playChimeAndPause(false);
+  if (!pttHeld) return;
   try {
     await ensurePttMic();
     if (pttCtx.state === "suspended") { try { await pttCtx.resume(); } catch {} }
@@ -402,19 +531,22 @@ async function enterPtt() {
     enterPause();
     return;
   }
-  pttBuffer = [];
-  if (startPromise) { try { await startPromise; } catch {} }
   if (!pttHeld) return;
+  pttBuffer = [];
   wsSendJson({ type: "audio_start" });
 }
 
 // Called when the user releases during PTT. Flushes the captured audio
-// as one utterance, plays the close-chime, and returns to pause state.
+// as one utterance and returns to pause state. The close-chime plays
+// while the visible state is still "recording"; we wait for it to clear
+// before transitioning to the next phase (and starting the arp) so the
+// chime tail doesn't get stepped on. audio_end is sent immediately so
+// the server can begin STT in parallel with the chime.
 async function exitPtt() {
   pttHeld = false;
-  playChime(true);
-  if (startPromise) { try { await startPromise; } catch { sessionMode = "pause"; setStateGlyph(); return; } }
+  if (startPromise) { try { await startPromise; } catch { sessionMode = "pause"; applySessionMode(); return; } }
   const total = pttBuffer.reduce((n, a) => n + a.length, 0);
+  let nextPhase;
   if (total > 0) {
     const flat = new Float32Array(total);
     let off = 0;
@@ -422,13 +554,33 @@ async function exitPtt() {
     pttBuffer = [];
     sendUtterance(flat);
     wsSendJson({ type: "audio_end", sampleRate: TARGET_CAPTURE_RATE });
-    setPhase("transcribing");
-    arp?.start();
+    nextPhase = "transcribing";
   } else {
-    setPhase("idle");
+    nextPhase = "paused";
   }
   sessionMode = "pause";
-  setStateGlyph();
+  applySessionMode();
+  // Clear the recording glow immediately so it doesn't linger through
+  // the close chime. Flip to "transcribing" (which starts the arp) only
+  // AFTER the chime is done — audio_end above kicked off STT already.
+  setPhase("paused");
+  await releasePttMic();
+  await playChimeAndPause(true);
+  // See enterPause: skip the placeholder if the server already raced past it.
+  if (nextPhase !== "paused" && prevPhase === "paused") setPhase(nextPhase);
+}
+
+async function releasePttMic() {
+  if (!pttCtx) return;
+  try { pttProcessor?.disconnect(); } catch {}
+  try { pttSource?.disconnect(); } catch {}
+  try { pttStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  try { pttCtx.close(); } catch {}
+  pttCtx = null;
+  pttStream = null;
+  pttSource = null;
+  pttProcessor = null;
+  await new Promise((r) => setTimeout(r, MIC_OFF_SETTLE_MS));
 }
 
 // Start orb: same gesture model as the main orb. Tap dismisses the
@@ -438,11 +590,12 @@ startOrb.addEventListener("pointerdown", (e) => {
   console.log("[start] pointerdown disabled=", startOrb.classList.contains("disabled"),
               "started=", started, "prefetchDone=", prefetchDone);
   if (startOrb.classList.contains("disabled") || started) return;
+  if (document.body.classList.contains("reconnecting")) return;
   e.preventDefault();
   try { startOrb.setPointerCapture(e.pointerId); } catch {}
   startOrb.classList.add("disabled");
   started = true;
-  holdTimer = setTimeout(() => { holdTimer = null; enterPtt(); setOrbGlyph(startOrb, "wave"); }, HOLD_THRESHOLD_MS);
+  holdTimer = setTimeout(() => { holdTimer = null; enterPtt(); }, HOLD_THRESHOLD_MS);
   startPromise = start()
     .then(() => { console.log("[start] start() resolved"); })
     .catch((err) => {
@@ -461,19 +614,21 @@ async function onStartOrbRelease() {
   if (holdTimer) {
     clearTimeout(holdTimer);
     holdTimer = null;
+    // Wait for start() (playerCtx + worklet + WS) before opening the VAD
+    // mic. On mobile, MicVAD.new() racing with playerCtx setup breaks
+    // getUserMedia and live mode silently fails to start. Pre-PTT this
+    // was naturally serialized because initMic ran inside start().
+    if (startPromise) { try { await startPromise; } catch { return; } }
     if (sessionMode === "pause") {
       enterLive().catch((e) => console.error("[live] failed:", e));
     } else if (sessionMode === "live") {
       enterPause();
     }
-    setOrbGlyph(startOrb, "pause");
-    if (startPromise) { try { await startPromise; } catch { return; } }
     startOverlay.classList.add("hidden");
     return;
   }
   // Hold past threshold → PTT was entered. Finalize it.
   if (sessionMode === "ptt" && pttHeld) {
-    setOrbGlyph(startOrb, "pause");
     await exitPtt();
   }
   startOverlay.classList.add("hidden");
@@ -486,6 +641,7 @@ startOrb.addEventListener("pointercancel", onStartOrbRelease);
 let mainHoldTimer = null;
 orbDot.addEventListener("pointerdown", (e) => {
   if (!started || sessionMode === "ptt") return;
+  if (document.body.classList.contains("reconnecting")) return;
   e.preventDefault();
   try { orbDot.setPointerCapture(e.pointerId); } catch {}
   mainHoldTimer = setTimeout(() => { mainHoldTimer = null; enterPtt(); }, HOLD_THRESHOLD_MS);
@@ -575,6 +731,11 @@ async function initMic() {
     minSpeechFrames: 16,
     redemptionFrames: 6,
     preSpeechPadFrames: 3,
+    onFrameProcessed: (_probs, frame) => {
+      // Buffer every frame VAD emits during a speech segment so enterPause()
+      // can flush a partial utterance if the user pauses mid-sentence.
+      if (vadSpeaking) vadBuffer.push(new Float32Array(frame));
+    },
     onSpeechStart: () => {
       console.log("[vad] onSpeechStart speaking=", speaking, "thinking=", thinking);
       // Ignore VAD entirely while the socket is down — we can't send the
@@ -592,37 +753,34 @@ async function initMic() {
         workletEmpty = true;
         wsSendJson({ type: "cancel" });
       }
-      // Quiet the thinking sound so it doesn't sit under the user's voice;
-      // if this turns out to be a misfire, onVADMisfire/empty-STT will
-      // resurrect it (we're still waiting on a pending turn).
-      arp?.stop();
-      setPhase("listening");
+      vadSpeaking = true;
+      vadBuffer = [];
+      setPhase("recording");
       wsSendJson({ type: "audio_start" });
     },
     onSpeechEnd: (audio) => {
       console.log("[vad] onSpeechEnd speaking=", speaking, "thinking=", thinking);
+      vadSpeaking = false;
+      vadBuffer = [];
       if (!ws || ws.readyState !== 1) return;
       // audio: Float32Array of the complete utterance @ 16kHz.
       sendUtterance(audio);
       setPhase("transcribing");
       wsSendJson({ type: "audio_end", sampleRate: TARGET_CAPTURE_RATE });
-      // Cute "thinking" sound while we wait for STT → LLM → first TTS frame.
-      // We don't flip `thinking` here because STT might come back empty — we
-      // wait for the server's "transcript" message to commit.
-      arp?.start();
     },
     onVADMisfire: () => {
       console.log("[vad] onVADMisfire speaking=", speaking, "thinking=", thinking);
+      vadSpeaking = false;
+      vadBuffer = [];
       if (!ws || ws.readyState !== 1) return;
       // Too-short burst — VAD-web emits this instead of onSpeechEnd; we just
-      // drop the audio and roll back UI state. If a prior turn is still
-      // pending, resume the thinking sound we silenced in onSpeechStart.
+      // drop the audio and roll back UI state.
       if (speaking) setPhase("speaking");
-      else if (thinking) { setPhase("thinking"); arp?.start(); }
-      else setPhase("idle");
+      else if (thinking) setPhase("thinking");
+      else setPhase(restingPhase());
     },
   });
-  micVad.start();
+  await micVad.start();
 }
 
 let reconnectTimer = null;
@@ -639,7 +797,11 @@ function resetSessionState() {
   }
   thinking = false;
   for (const p of PHASES) setBodyState(p, false);
+  // setPhase isn't called here (we leave status as "reconnecting"), so stop
+  // the arp explicitly and reset prevPhase so the next setPhase doesn't see
+  // a stale transition.
   arp?.stop();
+  prevPhase = null;
   // Drop any pending utterance/transcript UI hints from the dead session.
   setStatus("reconnecting");
   // Leave micVad running across reconnects. destroy() would force a fresh
@@ -656,11 +818,20 @@ async function initSession() {
   // pure PTT session). The live-mode entry path calls ensureLiveMic()
   // explicitly. On reconnect, re-init only if we were already in live.
   if (sessionMode === "live" && !micVad) await initMic();
-  setPhase("idle");
+  // Only set a phase here if nothing else has — on reconnect, resetSessionState
+  // wipes prevPhase so we need to restore. On initial bring-up, the session-
+  // mode handler that triggered start() (enterPtt, enterLive, or nothing for
+  // a passive autostart) already owns the phase.
+  if (!prevPhase) setPhase(restingPhase());
 }
 
 async function ensureLiveMic() {
+  // First call lazily loads the model + worker + AudioContext. Subsequent
+  // calls (after enterPause → releaseLiveMic → micVad.pause()) just resume
+  // the existing instance via micVad.start(), which re-acquires the mic
+  // stream without re-downloading any assets.
   if (!micVad) await initMic();
+  else await micVad.start();
 }
 
 // Raw PTT capture: a parallel getUserMedia + ScriptProcessor that
@@ -712,6 +883,7 @@ function openWs(isReconnect = false) {
     ws.addEventListener("open", () => {
       reconnectDelayMs = 500;
       setBodyState("error", false);
+      setBodyState("reconnecting", false);
       settled = true;
       resolve();
     });
@@ -724,6 +896,7 @@ function openWs(isReconnect = false) {
     ws.addEventListener("close", () => {
       setStatus("reconnecting");
       setBodyState("error", true);
+      setBodyState("reconnecting", true);
       resetSessionState();
       scheduleReconnect();
     });
@@ -754,12 +927,11 @@ function onWsMessage(ev) {
   } else {
     const i16 = new Int16Array(ev.data);
     // First PCM frame after a synth/drain gap: audible playback begins
-    // now. Stop the thinking arp and flip from the "synth" glow to
-    // "speaking" (no-ops if we're already in speaking — e.g. mid-stream
-    // between sentences). The listening class is the barge-in case;
-    // don't clobber it.
+    // now. Flip from the "synth" glow to "speaking" (which stops the arp
+    // via setPhase). No-op if we're already in speaking — e.g. mid-stream
+    // between sentences. The listening class is the barge-in case; don't
+    // clobber it.
     if (workletEmpty) {
-      arp?.stop();
       if (speaking && !document.body.classList.contains("listening")) {
         setPhase("speaking");
       }
@@ -784,11 +956,10 @@ function handleControl(msg) {
       maybeAutoStart();
       break;
     case "status":
-      // Empty STT for THIS utterance: server won't commit a turn. Go
-      // back to idle and stop the thinking sound.
+      // Empty STT for THIS utterance: server won't commit a turn. Return
+      // to the resting phase (which stops the thinking arp via setPhase).
       if (msg.message === "empty transcription") {
-        setPhase("idle");
-        arp?.stop();
+        setPhase(restingPhase());
       }
       // Other status messages are server-side breadcrumbs — don't
       // overwrite the phase-driven status text.
@@ -811,13 +982,16 @@ function handleControl(msg) {
       break;
     case "tts_start":
       console.log("[tts] tts_start (synth phase — waiting for first PCM)");
+      // Only flip to "synthesizing" on the FIRST tts_start of a turn. In
+      // sentence-chunked mode the server emits one tts_start per HTTP
+      // request, so subsequent sentences within the same turn would
+      // bounce speaking → synthesizing → speaking and briefly restart
+      // the arp in the inter-sentence gap. While speaking is already
+      // true, stay in the speaking phase — new PCM frames just keep
+      // flowing.
+      if (!speaking) setPhase("synthesizing");
       speaking = true;
       ttsServerEnded = false;
-      // The server has only kicked off the TTS HTTP request — in block
-      // (non-sentence-streaming) mode several seconds can pass before
-      // the first PCM frame. Show a distinct "synth" glow until then;
-      // the speaking phase and arp-stop both fire on first PCM below.
-      setPhase("synthesizing");
       break;
     case "tts_cancel":
       console.log("[tts] tts_cancel");
@@ -840,7 +1014,7 @@ function handleControl(msg) {
       break;
     case "agent_end":
       thinking = false;
-      if (!speaking) setPhase("idle");
+      if (!speaking) setPhase(restingPhase());
       break;
     case "error":
       thinking = false;
@@ -848,6 +1022,7 @@ function handleControl(msg) {
       setBodyState("error", true);
       setStatus(`error: ${msg.message}`);
       arp?.stop();
+      prevPhase = null;
       break;
   }
 }
