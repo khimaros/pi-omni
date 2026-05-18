@@ -117,6 +117,24 @@ async function main(): Promise<void> {
     `pi session ready: ${session.model ? `${session.model.provider}/${session.model.id}` : "(no model)"}`,
   );
 
+  // Append the voice system prompt to the session's base system prompt so
+  // every turn carries it implicitly — instead of prepending it as a fake
+  // user message before each utterance. agent-session resets state.systemPrompt
+  // to _baseSystemPrompt at the start of every prompt() (see agent-session.js
+  // ~line 797), so we mutate the base directly. The session has no public
+  // setter for this; pi-coding-agent's documented path is a before_agent_start
+  // extension, which standalone pi-omni-web doesn't have machinery for.
+  const voicePrompt = cfg.voiceSystemPrompt?.trim();
+  if (voicePrompt) {
+    const s = session as unknown as {
+      _baseSystemPrompt: string;
+      agent: { state: { systemPrompt: string } };
+    };
+    s._baseSystemPrompt = `${s._baseSystemPrompt}\n\n${voicePrompt}`;
+    s.agent.state.systemPrompt = s._baseSystemPrompt;
+    log(`appended voice system prompt (${voicePrompt.length} chars)`);
+  }
+
   // Surface what tools the session actually has and any extension/resource
   // load errors — silent extension failures are the #1 reason tool calls
   // mysteriously do nothing.
@@ -241,14 +259,17 @@ async function main(): Promise<void> {
   });
 
   const sendUserMessage = async (text: string): Promise<void> => {
-    // Prepend the voice system prompt as a one-shot instruction so the model
-    // shapes its reply for speech. (In the in-pi extension this is injected
-    // via before_agent_start — standalone has no extension hook, so inline.)
-    const voicePrompt = cfg.voiceSystemPrompt?.trim();
-    const message = voicePrompt ? `${voicePrompt}\n\n${text}` : text;
     logEvent("submit", text);
     try {
-      await session.prompt(message);
+      // Voice is push-to-talk: if the user speaks again while the agent is
+      // still streaming the previous turn, hard-cancel the in-flight model
+      // call (abort waits for idle) and then send the new prompt fresh.
+      // steer() would only queue a soft interjection without aborting.
+      if (session.isStreaming) {
+        log("aborting in-flight turn for new voice prompt");
+        await session.abort();
+      }
+      await session.prompt(text);
     } catch (e) {
       log(`session.prompt error: ${(e as Error).message}`, "error");
       activeSession?.onAgentEnd();
