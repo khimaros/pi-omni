@@ -29,7 +29,9 @@ const DEFAULTS: VoiceConfig = {
   vadMaxRecordingMs: 30000,
   voiceShortcut: "alt+v",
   cancelShortcut: "esc",
-  ttsStreamSentences: true,
+  ttsChunkSentences: true,
+  ttsStreamAudio: true,
+  ttsInterSentenceGapMs: 200,
   aecEnabled: false,
   aecPlaybackDelayMs: 200,
   bargeInEnabled: false,
@@ -80,7 +82,13 @@ export async function loadConfig(): Promise<LoadedConfig> {
     vadMaxRecordingMs: numOrUndef(process.env.PI_VOICE_VAD_MAX_MS),
     voiceShortcut: process.env.PI_VOICE_SHORTCUT,
     cancelShortcut: process.env.PI_VOICE_CANCEL_SHORTCUT,
-    ttsStreamSentences: boolOrUndef(process.env.PI_VOICE_TTS_STREAM_SENTENCES),
+    // Accept legacy PI_VOICE_TTS_STREAM_SENTENCES for ttsChunkSentences so
+    // existing systemd units / .env files keep working after the rename.
+    ttsChunkSentences:
+      boolOrUndef(process.env.PI_VOICE_TTS_CHUNK_SENTENCES) ??
+      boolOrUndef(process.env.PI_VOICE_TTS_STREAM_SENTENCES),
+    ttsStreamAudio: boolOrUndef(process.env.PI_VOICE_TTS_STREAM_AUDIO),
+    ttsInterSentenceGapMs: numOrUndef(process.env.PI_VOICE_TTS_INTER_SENTENCE_GAP_MS),
     aecEnabled: boolOrUndef(process.env.PI_VOICE_AEC_ENABLED),
     aecPlaybackDelayMs: numOrUndef(process.env.PI_VOICE_AEC_DELAY_MS),
     bargeInEnabled: boolOrUndef(process.env.PI_VOICE_BARGE_IN),
@@ -131,10 +139,19 @@ export async function loadConfig(): Promise<LoadedConfig> {
       env.voiceShortcut ?? fileCfg.voiceShortcut ?? DEFAULTS.voiceShortcut,
     cancelShortcut:
       env.cancelShortcut ?? fileCfg.cancelShortcut ?? DEFAULTS.cancelShortcut,
-    ttsStreamSentences:
-      env.ttsStreamSentences ??
-      fileCfg.ttsStreamSentences ??
-      DEFAULTS.ttsStreamSentences,
+    // Honor legacy ttsStreamSentences key in saved omni.json so an existing
+    // user config still resolves correctly post-rename.
+    ttsChunkSentences:
+      env.ttsChunkSentences ??
+      fileCfg.ttsChunkSentences ??
+      (fileCfg as { ttsStreamSentences?: boolean }).ttsStreamSentences ??
+      DEFAULTS.ttsChunkSentences,
+    ttsStreamAudio:
+      env.ttsStreamAudio ?? fileCfg.ttsStreamAudio ?? DEFAULTS.ttsStreamAudio,
+    ttsInterSentenceGapMs:
+      env.ttsInterSentenceGapMs ??
+      fileCfg.ttsInterSentenceGapMs ??
+      DEFAULTS.ttsInterSentenceGapMs,
     aecEnabled:
       env.aecEnabled ?? fileCfg.aecEnabled ?? DEFAULTS.aecEnabled,
     aecPlaybackDelayMs:

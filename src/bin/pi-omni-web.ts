@@ -90,72 +90,77 @@ async function main(): Promise<void> {
   // STT/TTS endpoint client — LLM is handled by pi-coding-agent below.
   const sttTtsClient = new OpenAI({ baseURL: cfg.baseURL, apiKey: cfg.apiKey });
 
-  const runtime = await createAgentSessionRuntime(
-    async ({ cwd, sessionManager, sessionStartEvent }: any) => {
-      const services = await createAgentSessionServices({ cwd, agentDir });
-      const scopedModels = resolveScopedModelsFromSettings(services);
-      return {
-        ...(await createAgentSessionFromServices({
+  // Each browser session gets its own pi runtime/session: hitting refresh
+  // (or opening a second tab) yields a clean conversation, not a shared one.
+  // Trade-off: extensions re-init per connection — slower first-utterance
+  // latency, but the only correct behavior when multiple users / tabs hit
+  // the same server.
+  const createPiSessionForConnection = async (
+    connLog: (m: string, l?: "info" | "warning" | "error") => void,
+  ) => {
+    const runtime = await createAgentSessionRuntime(
+      async ({ cwd, sessionManager, sessionStartEvent }: any) => {
+        const services = await createAgentSessionServices({ cwd, agentDir });
+        const scopedModels = resolveScopedModelsFromSettings(services);
+        return {
+          ...(await createAgentSessionFromServices({
+            services,
+            sessionManager,
+            sessionStartEvent,
+            scopedModels,
+          })),
           services,
-          sessionManager,
-          sessionStartEvent,
-          scopedModels,
-        })),
-        services,
-        diagnostics: services.diagnostics,
+          diagnostics: services.diagnostics,
+        };
+      },
+      {
+        cwd,
+        agentDir,
+        sessionManager: SessionManager.create(cwd, sessionDir),
+      },
+    );
+    const session = runtime.session;
+    await session.bindExtensions({});
+    connLog(
+      `pi session ready: ${session.model ? `${session.model.provider}/${session.model.id}` : "(no model)"}`,
+    );
+
+    // Append the voice system prompt to the session's base system prompt so
+    // every turn carries it implicitly — instead of prepending it as a fake
+    // user message before each utterance. agent-session resets state.systemPrompt
+    // to _baseSystemPrompt at the start of every prompt() (see agent-session.js
+    // ~line 797), so we mutate the base directly. The session has no public
+    // setter for this; pi-coding-agent's documented path is a before_agent_start
+    // extension, which standalone pi-omni-web doesn't have machinery for.
+    const voicePrompt = cfg.voiceSystemPrompt?.trim();
+    if (voicePrompt) {
+      const s = session as unknown as {
+        _baseSystemPrompt: string;
+        agent: { state: { systemPrompt: string } };
       };
-    },
-    {
-      cwd,
-      agentDir,
-      sessionManager: SessionManager.create(cwd, sessionDir),
-    },
-  );
-  const session = runtime.session;
-  await session.bindExtensions({});
-  log(
-    `pi session ready: ${session.model ? `${session.model.provider}/${session.model.id}` : "(no model)"}`,
-  );
-
-  // Append the voice system prompt to the session's base system prompt so
-  // every turn carries it implicitly — instead of prepending it as a fake
-  // user message before each utterance. agent-session resets state.systemPrompt
-  // to _baseSystemPrompt at the start of every prompt() (see agent-session.js
-  // ~line 797), so we mutate the base directly. The session has no public
-  // setter for this; pi-coding-agent's documented path is a before_agent_start
-  // extension, which standalone pi-omni-web doesn't have machinery for.
-  const voicePrompt = cfg.voiceSystemPrompt?.trim();
-  if (voicePrompt) {
-    const s = session as unknown as {
-      _baseSystemPrompt: string;
-      agent: { state: { systemPrompt: string } };
-    };
-    s._baseSystemPrompt = `${s._baseSystemPrompt}\n\n${voicePrompt}`;
-    s.agent.state.systemPrompt = s._baseSystemPrompt;
-    log(`appended voice system prompt (${voicePrompt.length} chars)`);
-  }
-
-  // Surface what tools the session actually has and any extension/resource
-  // load errors — silent extension failures are the #1 reason tool calls
-  // mysteriously do nothing.
-  try {
-    const active = (session as any).getActiveToolNames?.() ?? [];
-    const all = (session as any).getAllTools?.() ?? [];
-    log(`tools active=${active.length} total=${all.length}: ${active.join(", ") || "(none)"}`);
-  } catch (e) {
-    log(`could not list tools: ${(e as Error).message}`, "warning");
-  }
-  const diag = (runtime as any).diagnostics ?? [];
-  if (Array.isArray(diag) && diag.length > 0) {
-    for (const d of diag) {
-      const type = d?.type ?? "info";
-      const lvl: "info" | "warning" | "error" =
-        type === "error" ? "error" : type === "warning" ? "warning" : "info";
-      log(`diag(${type}): ${d?.message ?? JSON.stringify(d)} ${d?.path ?? ""}`, lvl);
+      s._baseSystemPrompt = `${s._baseSystemPrompt}\n\n${voicePrompt}`;
+      s.agent.state.systemPrompt = s._baseSystemPrompt;
+      connLog(`appended voice system prompt (${voicePrompt.length} chars)`);
     }
-  }
 
-  let activeSession: WebSession | undefined;
+    try {
+      const active = (session as any).getActiveToolNames?.() ?? [];
+      const all = (session as any).getAllTools?.() ?? [];
+      connLog(`tools active=${active.length} total=${all.length}: ${active.join(", ") || "(none)"}`);
+    } catch (e) {
+      connLog(`could not list tools: ${(e as Error).message}`, "warning");
+    }
+    const diag = (runtime as any).diagnostics ?? [];
+    if (Array.isArray(diag) && diag.length > 0) {
+      for (const d of diag) {
+        const type = d?.type ?? "info";
+        const lvl: "info" | "warning" | "error" =
+          type === "error" ? "error" : type === "warning" ? "warning" : "info";
+        connLog(`diag(${type}): ${d?.message ?? JSON.stringify(d)} ${d?.path ?? ""}`, lvl);
+      }
+    }
+    return { runtime, session };
+  };
 
   // Transcript logging — every prompt, tool call, and assistant reply is
   // logged to stderr so journalctl shows the full conversation. Disable with
@@ -191,115 +196,129 @@ async function main(): Promise<void> {
     process.stderr.write(`[pi-omni-web] transcript ${kind}: ${body}\n`);
   };
 
-  // Fan pi session events out to the active WebSession and the transcript log.
-  // The WebSession path only needs deltas + turn end + agent end (mirrors the
-  // in-pi extension); the log path captures everything else (messages, tools).
-  session.subscribe((event: any) => {
-    const ws = activeSession;
-    switch (event?.type) {
-      case "message_start": {
-        const msg = event.message;
-        const role = msg?.role;
-        if (role === "user") {
-          logEvent("user", stringifyContent(msg.content));
-        }
-        return;
-      }
-      case "message_update": {
-        const ame = event?.assistantMessageEvent;
-        if (!ame) return;
-        switch (ame.type) {
-          case "text_delta":
-            if (typeof ame.delta === "string") ws?.onLlmDelta(ame.delta);
-            return;
-          case "thinking_end":
-            if (typeof ame.content === "string") logEvent("thinking", ame.content);
-            return;
-          case "toolcall_end":
-            logEvent("toolcall", ame.toolCall);
-            return;
-          case "error":
-            logEvent("ame_error", { reason: ame.reason, error: ame.error });
-            return;
-        }
-        return;
-      }
-      case "message_end": {
-        const msg = event.message;
-        if (msg?.role === "assistant") {
-          logEvent("assistant", stringifyContent(msg.content));
-        } else if (msg?.role === "tool" || msg?.role === "toolResult") {
-          logEvent("tool_result", {
-            toolCallId: msg.toolCallId,
-            content: stringifyContent(msg.content),
-          });
-        }
-        return;
-      }
-      case "tool_execution_start":
-        logEvent("tool_call", {
-          tool: event.toolName,
-          args: event.args,
-        });
-        return;
-      case "tool_execution_end":
-        logEvent("tool_end", {
-          tool: event.toolName,
-          isError: event.isError,
-          result: event.result,
-        });
-        return;
-      case "turn_end":
-        ws?.onTurnEnd(event);
-        return;
-      case "agent_end":
-        ws?.onAgentEnd();
-        return;
-    }
-  });
-
-  const sendUserMessage = async (text: string): Promise<void> => {
-    logEvent("submit", text);
-    try {
-      // Voice is push-to-talk: if the user speaks again while the agent is
-      // still streaming the previous turn, hard-cancel the in-flight model
-      // call (abort waits for idle) and then send the new prompt fresh.
-      // steer() would only queue a soft interjection without aborting.
-      if (session.isStreaming) {
-        log("aborting in-flight turn for new voice prompt");
-        await session.abort();
-      }
-      await session.prompt(text);
-    } catch (e) {
-      log(`session.prompt error: ${(e as Error).message}`, "error");
-      activeSession?.onAgentEnd();
-    }
-  };
+  // Track per-connection runtimes so shutdown can dispose them all.
+  const liveRuntimes = new Set<{ dispose: () => Promise<void> }>();
 
   const server = await startWebServer({
     host,
     port,
     logger: log,
-    makeSession: (ws, logger) => {
-      if (activeSession) {
+    makeSession: async (ws, logger) => {
+      const { runtime, session } = await createPiSessionForConnection(logger);
+      liveRuntimes.add(runtime);
+
+      let webSession: WebSession | undefined;
+
+      // Per-connection event fan-out: events from THIS pi session route to
+      // THIS connection's WebSession only. The transcript log captures
+      // everything else (messages, tools).
+      const unsubscribe = session.subscribe((event: any) => {
+        const ws = webSession;
+        switch (event?.type) {
+          case "message_start": {
+            const msg = event.message;
+            const role = msg?.role;
+            if (role === "user") {
+              logEvent("user", stringifyContent(msg.content));
+            }
+            return;
+          }
+          case "message_update": {
+            const ame = event?.assistantMessageEvent;
+            if (!ame) return;
+            switch (ame.type) {
+              case "text_delta":
+                if (typeof ame.delta === "string") ws?.onLlmDelta(ame.delta);
+                return;
+              case "thinking_end":
+                if (typeof ame.content === "string") logEvent("thinking", ame.content);
+                return;
+              case "toolcall_end":
+                logEvent("toolcall", ame.toolCall);
+                return;
+              case "error":
+                logEvent("ame_error", { reason: ame.reason, error: ame.error });
+                return;
+            }
+            return;
+          }
+          case "message_end": {
+            const msg = event.message;
+            if (msg?.role === "assistant") {
+              logEvent("assistant", stringifyContent(msg.content));
+            } else if (msg?.role === "tool" || msg?.role === "toolResult") {
+              logEvent("tool_result", {
+                toolCallId: msg.toolCallId,
+                content: stringifyContent(msg.content),
+              });
+            }
+            return;
+          }
+          case "tool_execution_start":
+            logEvent("tool_call", { tool: event.toolName, args: event.args });
+            return;
+          case "tool_execution_end":
+            logEvent("tool_end", {
+              tool: event.toolName,
+              isError: event.isError,
+              result: event.result,
+            });
+            return;
+          case "turn_end":
+            ws?.onTurnEnd(event);
+            return;
+          case "agent_end":
+            ws?.onAgentEnd();
+            return;
+        }
+      });
+
+      const sendUserMessage = async (text: string): Promise<void> => {
+        logEvent("submit", text);
         try {
-          activeSession.dispose();
-        } catch {}
-      }
-      return new WebSession(ws, {
+          // Voice is push-to-talk: if the user speaks again while the agent is
+          // still streaming the previous turn, hard-cancel the in-flight model
+          // call (abort waits for idle) and then send the new prompt fresh.
+          // steer() would only queue a soft interjection without aborting.
+          if (session.isStreaming) {
+            logger("aborting in-flight turn for new voice prompt");
+            await session.abort();
+          }
+          await session.prompt(text);
+        } catch (e) {
+          logger(`session.prompt error: ${(e as Error).message}`, "error");
+          webSession?.onAgentEnd();
+        }
+      };
+
+      webSession = new WebSession(ws, {
         cfg,
         client: sttTtsClient,
         sendUserMessage: (text) => {
           void sendUserMessage(text);
         },
-        onActivate: (s) => {
-          activeSession = s;
-        },
-        onDeactivate: (s) => {
-          if (activeSession === s) activeSession = undefined;
-        },
+        // onActivate/onDeactivate are no-ops now that each connection owns
+        // its own pi session — there's no shared active-session to track.
+        onActivate: () => {},
+        onDeactivate: () => {},
         logger,
       });
+
+      // Wrap dispose so closing the WS also tears down this connection's
+      // pi runtime. Without this, every refresh would leak a session.
+      const origDispose = webSession.dispose.bind(webSession);
+      webSession.dispose = () => {
+        try {
+          unsubscribe();
+        } catch {}
+        origDispose();
+        liveRuntimes.delete(runtime);
+        void runtime.dispose().catch((e) => {
+          logger(`runtime.dispose error: ${(e as Error).message}`, "warning");
+        });
+      };
+
+      return webSession;
     },
   });
 
@@ -310,9 +329,12 @@ async function main(): Promise<void> {
       try {
         await server.close();
       } catch {}
-      try {
-        await runtime.dispose();
-      } catch {}
+      for (const r of liveRuntimes) {
+        try {
+          await r.dispose();
+        } catch {}
+      }
+      liveRuntimes.clear();
       process.exit(0);
     })();
   };

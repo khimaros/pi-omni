@@ -44,9 +44,23 @@ export type VoiceConfig = {
   // and exits continuous chat mode. Empty string disables.
   cancelShortcut: string;
   // When true, sanitize+enqueue each completed sentence as the LLM streams
-  // (lower time-to-first-audio). When false, wait for turn_end and enqueue
-  // the whole assistant block as one TTS call.
-  ttsStreamSentences: boolean;
+  // (lower time-to-first-audio, multiple TTS calls per turn). When false,
+  // wait for turn_end and enqueue the whole assistant block as one TTS call.
+  ttsChunkSentences: boolean;
+  // When true, request server-sent-event PCM streaming from the TTS endpoint
+  // (stream_format=sse, first audio plays before the TTS call completes).
+  // When false, the endpoint returns the full PCM in one response — higher
+  // first-audio latency but works with TTS servers that don't speak SSE.
+  // Orthogonal to ttsChunkSentences: you can chunk into sentences without
+  // SSE (each sentence is a single non-streamed call), or stream audio for
+  // the whole turn without chunking.
+  ttsStreamAudio: boolean;
+  // Milliseconds of silence inserted between consecutive sentences in
+  // ttsChunkSentences mode. Without a gap, back-to-back synthesized sentences
+  // run together (the second sentence has no prosodic lead-in from the first
+  // since it was synthesized independently). 150-250ms feels natural. Set to
+  // 0 to disable. Has no effect when ttsChunkSentences=false.
+  ttsInterSentenceGapMs: number;
   // Acoustic echo cancellation via WebRTC AEC3 (WASM). Required for reliable
   // barge-in over speakers; without it the bot's own voice will trigger the
   // VAD. Adds ~10ms/frame of mic latency.
@@ -183,6 +197,8 @@ export class VoiceLoop {
       speed: cfg.ttsSpeed,
       instructions: cfg.ttsInstructions,
       language: cfg.ttsLanguage,
+      streamAudio: cfg.ttsStreamAudio,
+      interSentenceGapMs: cfg.ttsChunkSentences ? cfg.ttsInterSentenceGapMs : 0,
       logger,
       onPhase: (phase, info) => this.onTtsPhase(phase, info),
       onPcm: this.aec ? (pcm) => this.onTtsPcm(pcm) : undefined,
@@ -518,7 +534,7 @@ export class VoiceLoop {
       this.sawDeltasThisTurn = true;
       this.status("LLM streaming…");
     }
-    if (!this.cfg.ttsStreamSentences) return;
+    if (!this.cfg.ttsChunkSentences) return;
     for (const sentence of this.chunker.push(delta)) {
       const sanitized = sanitizeForSpeech(sentence);
       if (sanitized) this.tts.enqueue(sanitized);
@@ -532,7 +548,7 @@ export class VoiceLoop {
   //    message_update): sanitize the whole assistant text and enqueue once.
   onTurnEnd(event: unknown): void {
     if (this.state !== "thinking") return;
-    if (this.cfg.ttsStreamSentences && this.sawDeltasThisTurn) {
+    if (this.cfg.ttsChunkSentences && this.sawDeltasThisTurn) {
       for (const sentence of this.chunker.flush()) {
         const sanitized = sanitizeForSpeech(sentence);
         if (sanitized) this.tts.enqueue(sanitized);

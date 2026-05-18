@@ -191,7 +191,9 @@ export async function runOnboarding(
     vadMaxRecordingMs: current.vadMaxRecordingMs,
     voiceShortcut: current.voiceShortcut,
     cancelShortcut: current.cancelShortcut,
-    ttsStreamSentences: current.ttsStreamSentences,
+    ttsChunkSentences: current.ttsChunkSentences,
+    ttsStreamAudio: current.ttsStreamAudio,
+    ttsInterSentenceGapMs: current.ttsInterSentenceGapMs,
     aecEnabled,
     aecPlaybackDelayMs,
     bargeInEnabled,
@@ -334,6 +336,7 @@ async function testRoundTrip(ui: Ui, cfg: VoiceConfig): Promise<boolean> {
     voice: cfg.ttsVoice,
     sampleRate: cfg.ttsSampleRate,
     streamBatchSize: cfg.ttsStreamBatchSize,
+    streamAudio: cfg.ttsStreamAudio,
     speakerCmd: cfg.speakerCmd,
   });
   let diag;

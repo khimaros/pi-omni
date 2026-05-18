@@ -57,8 +57,13 @@ export type WebServerOptions = {
   host: string;
   port: number;
   // Factory invoked once per WS connection. The session takes ownership of
-  // the socket; on close it should release any pi-side resources.
-  makeSession: (ws: WebSocket, logger: (m: string, l?: string) => void) => WebSession;
+  // the socket; on close it should release any pi-side resources. May be
+  // async — bootstrap (e.g. spinning up a per-connection pi runtime) runs
+  // before the WebSession is returned.
+  makeSession: (
+    ws: WebSocket,
+    logger: (m: string, l?: string) => void,
+  ) => WebSession | Promise<WebSession>;
   logger: (m: string, l?: "info" | "warning" | "error") => void;
 };
 
@@ -96,14 +101,32 @@ export async function startWebServer(opts: WebServerOptions): Promise<RunningSer
     const url = new URL(req.url, "http://localhost");
     if (url.pathname !== "/ws") return socket.destroy();
     wss.handleUpgrade(req, socket, head, (ws) => {
-      const session = opts.makeSession(ws, (m, l) =>
-        opts.logger(m, (l as "info" | "warning" | "error" | undefined) ?? "info"),
-      );
-      ws.on("close", () => {
+      void (async () => {
+        let session: WebSession;
         try {
-          session.dispose();
-        } catch {}
-      });
+          session = await opts.makeSession(ws, (m, l) =>
+            opts.logger(m, (l as "info" | "warning" | "error" | undefined) ?? "info"),
+          );
+        } catch (e) {
+          opts.logger(`makeSession failed: ${(e as Error).message}`, "error");
+          try {
+            ws.close();
+          } catch {}
+          return;
+        }
+        // The socket may have closed during async bootstrap; dispose now if so.
+        if (ws.readyState === ws.CLOSED || ws.readyState === ws.CLOSING) {
+          try {
+            session.dispose();
+          } catch {}
+          return;
+        }
+        ws.on("close", () => {
+          try {
+            session.dispose();
+          } catch {}
+        });
+      })();
     });
   });
 

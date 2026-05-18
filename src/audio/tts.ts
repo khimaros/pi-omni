@@ -46,6 +46,14 @@ export type TtsOptions = {
   speed?: number;
   instructions?: string;
   language?: string;
+  // When false, don't request stream_format=sse — the endpoint returns the
+  // whole PCM body in one response. Useful for TTS servers that don't speak
+  // SSE; trades first-audio latency for compatibility.
+  streamAudio?: boolean;
+  // Silence (ms) inserted between consecutive sentences in drain(). Only
+  // fires when 2+ sentences are queued back-to-back — single-sentence turns
+  // (block mode) never trigger it. 0 disables.
+  interSentenceGapMs?: number;
   logger?: TtsLogger;
   onPhase?: TtsPhaseSink;
   // Tap for the AEC reference signal: fires for every PCM chunk written to
@@ -169,6 +177,12 @@ export class TtsPlayer {
             this.opts.logger?.(`tts: spawn failed: ${player.spawnError}`, "error");
             return;
           }
+        } else if ((this.opts.interSentenceGapMs ?? 0) > 0) {
+          // Each sentence is synthesized as an independent TTS call, so the
+          // next one starts with no prosodic lead-in from the previous —
+          // they run together. Insert a brief pad of silence to restore the
+          // natural pause at a sentence boundary.
+          this.writeSilence(player, this.opts.interSentenceGapMs ?? 0);
         }
         this.inflight = new AbortController();
         this.onPhase("synth_start", { text, queued: queuedBehind });
@@ -237,6 +251,21 @@ export class TtsPlayer {
     }
   }
 
+  // Write `ms` milliseconds of silence (S16_LE zeros at sampleRate) to the
+  // player and tee to onPcm so the AEC reference signal stays time-aligned.
+  private writeSilence(player: Player, ms: number): void {
+    if (ms <= 0) return;
+    const samples = Math.round((this.opts.sampleRate * ms) / 1000);
+    if (samples <= 0) return;
+    const silence = Buffer.alloc(samples * 2);
+    try {
+      player.proc.stdin?.write(silence);
+    } catch {}
+    try {
+      this.opts.onPcm?.(silence);
+    } catch {}
+  }
+
   private spawnPlayer(): Player {
     const parts = this.opts.speakerCmd.split(/\s+/).filter(Boolean);
     const [cmd, ...args] = parts;
@@ -288,14 +317,17 @@ export class TtsPlayer {
     httpError?: string;
   }> {
     const url = `${this.opts.baseURL.replace(/\/+$/, "")}/audio/speech`;
+    const streamAudio = this.opts.streamAudio !== false;
     const bodyObj: Record<string, unknown> = {
       input: text,
       model: this.opts.model,
       voice: this.opts.voice,
       response_format: "pcm",
-      stream_format: "sse",
-      stream_batch_size: this.opts.streamBatchSize,
     };
+    if (streamAudio) {
+      bodyObj.stream_format = "sse";
+      bodyObj.stream_batch_size = this.opts.streamBatchSize;
+    }
     if (this.opts.speed != null) bodyObj.speed = this.opts.speed;
     if (this.opts.instructions) bodyObj.instructions = this.opts.instructions;
     if (this.opts.language) bodyObj.language = this.opts.language;

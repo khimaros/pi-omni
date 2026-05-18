@@ -67,6 +67,12 @@ export class WebSession {
       speed: deps.cfg.ttsSpeed,
       instructions: deps.cfg.ttsInstructions,
       language: deps.cfg.ttsLanguage,
+      streamAudio: deps.cfg.ttsStreamAudio,
+      // Gap only matters in chunked mode (otherwise only one sentence is
+      // ever enqueued per turn, so drain() can't fire between-sentence).
+      interSentenceGapMs: deps.cfg.ttsChunkSentences
+        ? deps.cfg.ttsInterSentenceGapMs
+        : 0,
       // /dev/null sink — we don't want server-side playback.
       speakerCmd: "cat",
       logger: deps.logger,
@@ -103,7 +109,7 @@ export class WebSession {
     }
     // Forward raw delta for live display (browser appends).
     this.sendJson({ type: "llm_delta", text: delta });
-    if (!this.deps.cfg.ttsStreamSentences) return;
+    if (!this.deps.cfg.ttsChunkSentences) return;
     for (const sentence of this.chunker.push(delta)) {
       const s = sanitizeForSpeech(sentence);
       if (s) {
@@ -115,7 +121,7 @@ export class WebSession {
 
   onTurnEnd(event: unknown): void {
     if (!this.turnActive) return;
-    if (this.deps.cfg.ttsStreamSentences && this.sawDeltasThisTurn) {
+    if (this.deps.cfg.ttsChunkSentences && this.sawDeltasThisTurn) {
       for (const sentence of this.chunker.flush()) {
         const s = sanitizeForSpeech(sentence);
         if (s) this.tts.enqueue(s);
