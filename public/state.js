@@ -374,12 +374,16 @@ const HANDLERS = {
   },
 
   AGENT_END(state) {
+    // No activity for this turn yet → this is a stale drained end
+    // from a cancelled prior turn (server-side late-drain trade-off).
+    // Treat as a no-op: don't clear thinking, don't regress phase,
+    // don't show placeholder. The real new-turn agent_end will arrive
+    // later, after activity has been seen.
+    if (!state.sawTurnActivity) return { state, actions: [] };
     // Placeholder ("(no response)") only when the turn legitimately
-    // ended without producing text. "Legitimately" = we saw activity
-    // for THIS turn (a component or text delta). Without that signal,
-    // the agent_end is almost certainly stale (prior turn's drained
-    // end leaking past server-side suppression) and must not surface.
-    const isEmptyTurn = state.sawTurnActivity && !state.gotText;
+    // ended without producing text. sawTurnActivity guarantees it
+    // wasn't a stale end.
+    const isEmptyTurn = !state.gotText;
     const placeholderActions = isEmptyTurn ? [{ type: "SHOW_PLACEHOLDER" }] : [];
     const next = { ...state, thinking: false };
     if (next.speaking) return { state: next, actions: placeholderActions };

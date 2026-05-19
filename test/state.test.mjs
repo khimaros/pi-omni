@@ -231,6 +231,8 @@ test("full live-mode turn: vad start/end → transcript → tts → drain → ba
     { type: "VAD_SPEECH_START" },
     { type: "VAD_SPEECH_END" },
     { type: "TRANSCRIPT" },
+    { type: "COMPONENT" }, // thinking_end (real turn marker)
+    { type: "LLM_TEXT" },  // produced some text
     { type: "TTS_START" },
     { type: "PCM_FIRST" },
     { type: "TTS_END" },
@@ -489,10 +491,13 @@ test("stale AGENT_END from cancelled turn does not reset phase while new STT is 
   assert.equal(afterCancel.phase, "transcribing");
 
   // Stale agent_end from the cancelled turn — must NOT regress phase.
+  // It also leaves thinking alone since we treat no-activity ends as
+  // a no-op (the real new-turn end will clear thinking later).
   const { state: afterAgentEnd, actions } = reduce(afterCancel, { type: "AGENT_END" });
   assert.equal(afterAgentEnd.phase, "transcribing",
     "stale AGENT_END must not regress phase while new STT is pending");
-  assert.equal(afterAgentEnd.thinking, false);
+  assert.equal(afterAgentEnd.thinking, true,
+    "stale AGENT_END is a no-op — thinking stays until real new-turn end");
   assert.ok(!hasAction(actions, "ARP_STOP"), "arp must keep playing through the stale agent_end");
 });
 
@@ -566,7 +571,9 @@ test("AGENT_END arriving after an interrupt does not flip phase back", () => {
 
   const { state } = reduce(post, { type: "AGENT_END" });
   assert.equal(state.phase, "recording");
-  assert.equal(state.thinking, false);
+  // Stale AGENT_END (no activity for current turn) is a no-op; thinking
+  // stays set until a real end fires for the new turn.
+  assert.equal(state.thinking, true);
 });
 
 test("WORKLET_DRAINED while still in recording (post-barge) does not clobber phase", () => {
@@ -673,12 +680,13 @@ test("TRANSCRIPT resets the LLM_TEXT-seen flag for the next turn", () => {
     "TRANSCRIPT must reset gotText so the next empty turn still placeholders");
 });
 
-test("AGENT_END with no speech returns to resting phase (live → listening)", () => {
+test("AGENT_END with no speech (after activity) returns to resting phase (live → listening)", () => {
   const live = run([{ type: "TAP" }, { type: "OPEN_DONE", kind: "live" }]).state;
   const thinking = run([
     { type: "VAD_SPEECH_START" },
     { type: "VAD_SPEECH_END" },
     { type: "TRANSCRIPT" },
+    { type: "COMPONENT" }, // real turn activity
   ], live).state;
   const { state } = reduce(thinking, { type: "AGENT_END" });
   assert.equal(state.phase, "listening");
@@ -692,6 +700,8 @@ test("AGENT_END while speaking does NOT change phase", () => {
     { type: "VAD_SPEECH_START" },
     { type: "VAD_SPEECH_END" },
     { type: "TRANSCRIPT" },
+    { type: "COMPONENT" },
+    { type: "LLM_TEXT" },
     { type: "TTS_START" },
     { type: "PCM_FIRST" },
   ]).state;
@@ -801,7 +811,7 @@ test("VAD_SPEECH_END action carries the configured capture rate", () => {
 // LLM_TEXT (delta or full) is unambiguous evidence the LLM is producing
 // for the current turn — it must restore the thinking phase.
 
-test("LLM_TEXT after stale AGENT_END restores thinking phase", () => {
+test("stale AGENT_END is a no-op; phase + thinking preserved for new turn", () => {
   // PTT round-trip up to "phase=thinking" for the new turn.
   const ptt = run([
     { type: "HOLD" },
@@ -812,19 +822,18 @@ test("LLM_TEXT after stale AGENT_END restores thinking phase", () => {
   ]).state;
   assert.equal(ptt.phase, "thinking");
   // Stale AGENT_END from the cancelled prior turn slips through.
-  const stale = reduce(ptt, { type: "AGENT_END" }).state;
-  assert.equal(stale.phase, "paused",
-    "stale AGENT_END regresses phase (server bug; client must recover)");
-  assert.equal(stale.thinking, false);
-  // First delta of the real new turn must restore thinking.
+  const { state: stale, actions: staleActions } = reduce(ptt, { type: "AGENT_END" });
+  assert.equal(stale.phase, "thinking",
+    "stale AGENT_END (no activity yet) must not regress phase");
+  assert.equal(stale.thinking, true, "thinking flag preserved");
+  assert.ok(!hasAction(staleActions, "ARP_STOP"), "arp must keep playing");
+  // First delta of the real new turn — phase already thinking, just
+  // updates gotText/sawTurnActivity.
   const { state, actions } = reduce(stale, { type: "LLM_TEXT" });
-  assert.equal(state.phase, "thinking",
-    "LLM_TEXT must restore phase to thinking after stale agent_end regression");
-  assert.equal(state.thinking, true,
-    "LLM_TEXT signals an active turn — restore the thinking flag too");
+  assert.equal(state.phase, "thinking");
   assert.equal(state.gotText, true);
-  assert.ok(hasAction(actions, "ARP_START"),
-    "arp must resume since the turn is actually in progress");
+  assert.equal(state.sawTurnActivity, true);
+  assert.ok(!hasAction(actions, "ARP_START"), "arp already running, no restart");
 });
 
 test("LLM_TEXT while already in thinking is a no-op for phase", () => {
@@ -850,6 +859,8 @@ test("LLM_TEXT while speaking does not regress phase", () => {
     { type: "RELEASE" },
     { type: "CLOSE_DONE", hadAudio: true },
     { type: "TRANSCRIPT" },
+    { type: "COMPONENT" },
+    { type: "LLM_TEXT" },
     { type: "TTS_START" },
     { type: "PCM_FIRST" },
   ]).state;
@@ -871,14 +882,13 @@ test("LLM_TEXT restores thinking after stale AGENT_END on VAD barge path", () =>
     { type: "TRANSCRIPT" },                 // → thinking, gotText=false
   ]).state;
   assert.equal(ptt.phase, "thinking");
-  const stale = reduce(ptt, { type: "AGENT_END" }).state;
-  assert.equal(stale.phase, "listening",
-    "stale AGENT_END on live path regresses to listening (resting for live)");
-  const { state, actions } = reduce(stale, { type: "LLM_TEXT" });
-  assert.equal(state.phase, "thinking",
-    "LLM_TEXT must restore thinking even on the live/VAD path");
+  const { state: stale, actions: staleActions } = reduce(ptt, { type: "AGENT_END" });
+  assert.equal(stale.phase, "thinking",
+    "stale AGENT_END is a no-op on live path too");
+  assert.ok(!hasAction(staleActions, "ARP_STOP"));
+  const { state } = reduce(stale, { type: "LLM_TEXT" });
+  assert.equal(state.phase, "thinking");
   assert.equal(state.thinking, true);
-  assert.ok(hasAction(actions, "ARP_START"));
 });
 
 // ─── stale AGENT_END placeholder workaround ────────────────────────
@@ -970,4 +980,130 @@ test("TRANSCRIPT resets sawTurnActivity for a new turn", () => {
   const { actions } = reduce(t2, { type: "AGENT_END" });
   assert.ok(!hasAction(actions, "SHOW_PLACEHOLDER"),
     "turn 1's activity must not satisfy the guard for turn 2's stale agent_end");
+});
+
+// ─── post-TTS settle (the stuck-in-thinking bug) ───────────────────
+// After the second turn plays its response and the worklet drains,
+// the UI was reported stuck in "thinking" forever. Captures the full
+// barge-recovery sequence end-to-end and asserts the phase actually
+// settles back to paused once AGENT_END arrives.
+
+test("full PTT-barge round-trip settles to paused after TTS + AGENT_END", () => {
+  const final = run([
+    // First utterance (full turn).
+    { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
+    { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
+    { type: "TRANSCRIPT" }, { type: "COMPONENT" },
+    { type: "LLM_TEXT" }, { type: "TTS_START" },
+    { type: "PCM_FIRST" }, { type: "TTS_END" }, { type: "WORKLET_DRAINED" },
+    { type: "AGENT_END" },
+    // Barge: second utterance starts before first is done. Here the
+    // first turn has already settled, but the same flow applies.
+    { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
+    { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
+    { type: "TRANSCRIPT" }, { type: "COMPONENT" },
+    { type: "LLM_TEXT" }, { type: "TTS_START" },
+    { type: "PCM_FIRST" }, { type: "TTS_END" }, { type: "WORKLET_DRAINED" },
+    { type: "AGENT_END" },
+  ]).state;
+  assert.equal(final.phase, "paused", "must settle to paused after final agent_end");
+  assert.equal(final.thinking, false);
+  assert.equal(final.speaking, false);
+});
+
+test("turn settles after WORKLET_DRAINED if AGENT_END arrives before drain", () => {
+  // Common ordering: agent_end fires while TTS is still playing the
+  // last chunk; the worklet drains a moment later. The handler must
+  // clear thinking and the eventual WORKLET_DRAINED must transition
+  // to resting (not "thinking").
+  const final = run([
+    { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
+    { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
+    { type: "TRANSCRIPT" }, { type: "COMPONENT" },
+    { type: "LLM_TEXT" }, { type: "TTS_START" }, { type: "PCM_FIRST" },
+    { type: "AGENT_END" },      // agent_end during speaking
+    { type: "TTS_END" }, { type: "WORKLET_DRAINED" },
+  ]).state;
+  assert.equal(final.phase, "paused");
+});
+
+test("turn settles if WORKLET_DRAINED arrives before AGENT_END", () => {
+  // Reverse ordering: worklet drains first while LLM_TEXT had set
+  // thinking=true. maybeEndSpeaking would route to phase=thinking;
+  // then AGENT_END clears thinking and must transition to resting.
+  const final = run([
+    { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
+    { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
+    { type: "TRANSCRIPT" }, { type: "COMPONENT" },
+    { type: "LLM_TEXT" }, { type: "TTS_START" }, { type: "PCM_FIRST" },
+    { type: "TTS_END" }, { type: "WORKLET_DRAINED" },
+    { type: "AGENT_END" },      // agent_end after drain
+  ]).state;
+  assert.equal(final.phase, "paused");
+});
+
+test("turn stuck in thinking if AGENT_END never arrives (current behavior)", () => {
+  // Captures the observed bug. With no AGENT_END, LLM_TEXT's
+  // thinking=true sticks and WORKLET_DRAINED routes to thinking.
+  // This test documents that the state machine currently REQUIRES
+  // AGENT_END to settle. (If we want a timeout-style fallback later,
+  // this becomes a regression check.)
+  const final = run([
+    { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
+    { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
+    { type: "TRANSCRIPT" }, { type: "COMPONENT" },
+    { type: "LLM_TEXT" }, { type: "TTS_START" }, { type: "PCM_FIRST" },
+    { type: "TTS_END" }, { type: "WORKLET_DRAINED" },
+    // NO AGENT_END
+  ]).state;
+  assert.equal(final.phase, "thinking",
+    "without AGENT_END, current state machine sticks at thinking");
+});
+
+// ─── stale AGENT_END must not regress phase (the flicker bug) ───────
+// With the server-side trade-off (rearm decays pending; late drained
+// ends forward as natural), the client may see an AGENT_END BEFORE
+// any new-turn activity. The existing workaround already suppresses
+// the (no response) placeholder for this case. It must ALSO leave
+// the phase alone (no transcribing → paused regression) so the arp
+// doesn't briefly stop during the gap between the stale end and the
+// first new-turn delta.
+
+test("stale AGENT_END (no activity yet) does NOT regress phase from thinking", () => {
+  const ptt = run([
+    { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
+    { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
+    { type: "TRANSCRIPT" }, // → thinking
+  ]).state;
+  const { state, actions } = reduce(ptt, { type: "AGENT_END" });
+  assert.equal(state.phase, "thinking",
+    "stale agent_end must not regress phase — keeps arp running");
+  assert.ok(!hasAction(actions, "ARP_STOP"));
+  assert.ok(!hasAction(actions, "SHOW_PLACEHOLDER"));
+});
+
+test("stale AGENT_END preserves the thinking flag (turn isn't really over)", () => {
+  const ptt = run([
+    { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
+    { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
+    { type: "TRANSCRIPT" },
+  ]).state;
+  const { state } = reduce(ptt, { type: "AGENT_END" });
+  assert.equal(state.thinking, true,
+    "stale end must not clear thinking — real turn is still in progress");
+});
+
+test("real AGENT_END (after activity, no text) still regresses to resting + placeholder", () => {
+  // Empty-of-text turn: activity occurred (thinking_end component
+  // fired) but no LLM_TEXT — this is a legit empty turn, the existing
+  // behavior must continue: phase → resting, placeholder shown.
+  const post = run([
+    { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
+    { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
+    { type: "TRANSCRIPT" }, { type: "COMPONENT" },
+  ]).state;
+  const { state, actions } = reduce(post, { type: "AGENT_END" });
+  assert.equal(state.phase, "paused");
+  assert.equal(state.thinking, false);
+  assert.ok(hasAction(actions, "SHOW_PLACEHOLDER"));
 });

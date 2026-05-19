@@ -23,24 +23,28 @@ test("starts inactive", () => {
   assert.equal(t.isActive, false);
 });
 
-test("begin marks active; end clears", () => {
+test("begin marks active; end does NOT deactivate (active cleared only by replace)", () => {
+  // Active stays true through end() so late drained events from a
+  // prior turn (which may fire AFTER the new turn's natural end) can
+  // still be forwarded. The only path to active=false is begin()
+  // replacing an active turn at the next utterance.
   const t = new TurnLifecycle();
   t.begin();
   assert.equal(t.isActive, true);
-  t.end();
-  assert.equal(t.isActive, false);
+  assert.equal(t.end(), "natural");
+  assert.equal(t.isActive, true,
+    "end() must not deactivate — subsequent events for this turn keep forwarding");
 });
 
-test("race: begin → end (stale from cancelled turn) → rearm leaves active", () => {
-  // This is the symptom-bearing sequence. Without rearm(), the call
-  // graph leaves us inactive when the NEW turn's events arrive.
+test("race: begin → end → rearm leaves active (with non-deactivating end)", () => {
+  // After: end() no longer deactivates. This test now mainly asserts
+  // rearm idempotency in the post-end state.
   const t = new TurnLifecycle();
-  t.begin();             // STT completed; new turn provisionally active
-  t.end();               // stale agent_end from cancelled prior turn
-  assert.equal(t.isActive, false);
-  t.rearm();             // server calls this right before runtime.prompt()
-  assert.equal(t.isActive, true,
-    "rearm must re-assert active so the new turn's events are forwarded");
+  t.begin();
+  t.end();               // natural — does NOT deactivate
+  assert.equal(t.isActive, true);
+  t.rearm();
+  assert.equal(t.isActive, true);
 });
 
 test("rearm is a no-op when already active", () => {
@@ -50,14 +54,13 @@ test("rearm is a no-op when already active", () => {
   assert.equal(t.isActive, true);
 });
 
-test("end after rearm clears active normally", () => {
-  // The genuine end of the new turn (not a stale one) must still work.
+test("end after rearm classifies as natural", () => {
+  // end() no longer deactivates; we just assert classification.
   const t = new TurnLifecycle();
   t.begin();
-  t.end();     // stale
-  t.rearm();   // new turn live
-  t.end();     // real end of new turn
-  assert.equal(t.isActive, false);
+  t.end();
+  t.rearm();
+  assert.equal(t.end(), "natural");
 });
 
 // ─── cancellation: drop everything from the cancelled prior turn ───
@@ -88,19 +91,21 @@ test("end during cancellation window returns 'cancelled' and stays inactive", ()
   assert.equal(t.isActive, false);
 });
 
-test("rearm re-asserts active without clearing pending stale ends", () => {
-  // Updated semantics: rearm() does NOT consume the pending stale
-  // cancellation. The drained end is on its way and must still
-  // classify as "cancelled" when it fires.
+test("rearm decays one pending stale end (drain assumed by rearm time)", () => {
+  // Updated semantics: rearm() optimistically consumes one pending
+  // stale. If drain fired during abort, end() already consumed it
+  // (pending was 0). If drain hasn't fired yet, the late drained
+  // agent_end will classify as natural and be forwarded — frontend
+  // workaround handles that gracefully. This is the trade-off that
+  // prevents the new turn's natural end from being misclassified as
+  // cancelled and stuck-in-thinking.
   const t = new TurnLifecycle();
-  t.begin();
-  t.begin();
-  t.rearm();
+  t.begin();             // turn 1
+  t.begin();             // audio_end → pending=1
+  t.rearm();             // decays pending to 0
   assert.equal(t.isActive, true);
-  assert.equal(t.end(), "cancelled",
-    "drained prior-turn agent_end must still be cancelled even after rearm");
   assert.equal(t.end(), "natural",
-    "the NEXT end is the new turn's natural end");
+    "new turn's natural end must classify as natural (no leftover pending)");
 });
 
 test("client cancel mid-LLM, then late agent_end after, then new turn", () => {
@@ -227,17 +232,16 @@ test("client cancel arrives between begin-replace and abort drain", () => {
   assert.equal(t.end(), "natural");
 });
 
-test("rearm before drained agent_end keeps stale-end pending (fixed)", () => {
-  // Was a bug captured for the real-world race where pi-coding-agent's
-  // abort() returns before drained agent_end fires. Now fixed: rearm()
-  // preserves pendingStaleEnds, so the drained end still classifies
-  // as cancelled even when rearm has already happened.
+test("rearm before drained agent_end: late drain forwards as natural (trade-off)", () => {
+  // Trade-off note: when drain fires AFTER rearm, the late agent_end
+  // classifies as natural and is forwarded. Frontend's sawTurnActivity
+  // guard prevents the "(no response)" placeholder in that case.
   const t = new TurnLifecycle();
-  t.begin();                    // turn 1
-  t.begin();                    // audio_end → cancellation pending
-  t.rearm();                    // abort returned before drain
-  assert.equal(t.end(), "cancelled",
-    "drained agent_end after early rearm is still suppressed");
+  t.begin();
+  t.begin();
+  t.rearm();
+  assert.equal(t.end(), "natural",
+    "late drain after rearm forwards as natural (workaround handles UI)");
 });
 
 test("correct sequence: drain BEFORE rearm classifies as cancelled", () => {
@@ -265,55 +269,47 @@ test("correct sequence: drain BEFORE rearm classifies as cancelled", () => {
 // cancellations — those are consumed only by the matching end()
 // calls that follow.
 
-test("late drain after rearm still classifies as cancelled (single barge)", () => {
+test("late drain after rearm: active stays alive for new turn's deltas", () => {
+  // Most important invariant: active must stay true through any
+  // post-rearm event ordering so the new turn's deltas keep flowing.
   const t = new TurnLifecycle();
-  t.begin();                            // turn 1 active
-  t.begin();                            // audio_end → cancellation pending
-  t.rearm();                            // abort returned early
-  assert.equal(t.isActive, true,
-    "rearm must re-assert active so new turn's deltas forward");
-  assert.equal(t.end(), "cancelled",
-    "the late drained agent_end must STILL classify as cancelled");
-  assert.equal(t.isActive, true,
-    "active must remain true so new turn's deltas keep forwarding");
-  // Eventually the new turn ends naturally.
+  t.begin();
+  t.begin();
+  t.rearm();
+  assert.equal(t.isActive, true);
   assert.equal(t.end(), "natural");
-  assert.equal(t.isActive, false);
+  assert.equal(t.isActive, true,
+    "active must remain true so subsequent deltas keep forwarding");
+  // New turn's REAL natural end can be received without losing forwarding.
+  assert.equal(t.end(), "natural");
+  assert.equal(t.isActive, true);
 });
 
-test("two barges in a row: both stale ends classify as cancelled", () => {
+test("two barges in a row: both rearm decays clear pending; active stays", () => {
   const t = new TurnLifecycle();
   t.begin();                            // turn 1
-  t.begin();                            // barge → turn 2 begins, cancel pending
-  t.rearm();                            // abort #1 returns early
-  t.begin();                            // barge → turn 3 begins, second cancel pending
-  t.rearm();                            // abort #2 returns early
+  t.begin();                            // barge → pending=1, active=false
+  t.rearm();                            // decay → pending=0, active=true
+  t.begin();                            // barge → pending=1, active=false
+  t.rearm();                            // decay → pending=0, active=true
   assert.equal(t.isActive, true);
-  // Late drained agent_end #1 (from turn 1)
-  assert.equal(t.end(), "cancelled");
-  assert.equal(t.isActive, true);
-  // Late drained agent_end #2 (from turn 2)
-  assert.equal(t.end(), "cancelled");
-  assert.equal(t.isActive, true);
-  // Turn 3's real natural end.
+  // Any subsequent ends classify as natural.
   assert.equal(t.end(), "natural");
+  assert.equal(t.isActive, true);
 });
 
-test("client cancel + audio_end + late drain: single pending stale end", () => {
-  // cancel and the subsequent audio_end refer to the SAME prior turn,
-  // which will produce exactly ONE drained agent_end — so only one
-  // pending stale is queued (cancel adds it; begin-while-inactive does
-  // not double-count).
+test("client cancel + audio_end + rearm: pending decayed, new turn natural", () => {
+  // cancel and the subsequent audio_end refer to the SAME prior turn
+  // (one drained end expected). cancel adds 1 pending; begin-while-
+  // inactive doesn't double-count. rearm decays the one pending. New
+  // turn's natural end classifies as natural.
   const t = new TurnLifecycle();
-  t.begin();                            // turn 1
-  t.cancel();                           // WS cancel (PTT press) → pending=1
-  t.begin();                            // audio_end (active=false now) → just activates
-  t.rearm();                            // abort returned early
-  assert.equal(t.end(), "cancelled",
-    "turn 1's eventual drained agent_end");
+  t.begin();
+  t.cancel();                           // pending=1, active=false
+  t.begin();                            // active was false → activate, no extra pending
+  t.rearm();                            // decay → pending=0, active=true
+  assert.equal(t.end(), "natural");
   assert.equal(t.isActive, true);
-  assert.equal(t.end(), "natural",
-    "new turn's natural end");
 });
 
 test("rearm without pending stale cancellation is a clean re-arm", () => {
@@ -323,4 +319,21 @@ test("rearm without pending stale cancellation is a clean re-arm", () => {
   t.begin();
   t.rearm();
   assert.equal(t.end(), "natural");
+});
+
+test("if drain never fires, new turn's natural end is still natural (not cancelled)", () => {
+  // The bug after fixing the rearm-clears-cancellation issue: when
+  // pi-coding-agent's abort returns and the drained prior-turn
+  // agent_end NEVER fires (or fires after the new turn ends),
+  // pendingStaleEnds stays at 1. The new turn's natural agent_end
+  // then incorrectly classifies as "cancelled" and is suppressed —
+  // client never sees agent_end → UI sticks in thinking forever.
+  const t = new TurnLifecycle();
+  t.begin();                            // turn 1
+  t.begin();                            // audio_end → pending=1
+  t.rearm();                            // abort returned early
+  // Note: turn 1's drained agent_end NEVER fires here.
+  // Turn 2 runs to completion and emits its natural agent_end.
+  assert.equal(t.end(), "natural",
+    "new turn's natural end must classify as natural even if prior drain was lost");
 });
