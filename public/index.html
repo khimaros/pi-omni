@@ -182,6 +182,21 @@
     word-wrap: break-word;
     opacity: 0.95;
   }
+  /* Inline indicator chip for non-text LLM components (thinking, tool
+     calls, tool results). Uses the "thinking" glow amber so they read
+     as in-progress meta rather than part of the spoken answer. */
+  #assistant .component-chip {
+    display: inline-block;
+    margin: 0 4px 4px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(253,230,138,0.12);
+    color: rgb(253,230,138);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    vertical-align: middle;
+  }
   /* Pre-start disabled look on the main orb (during prefetch). */
   #orb.disabled .dot { opacity: 0.45; cursor: progress; }
   #start-hint {
@@ -191,6 +206,17 @@
   /* Keep layout intact when hidden — the orb is flex:1 and would
      re-center if this element collapsed. */
   #start-hint.hidden { visibility: hidden; }
+  /* Debug event-log overlay. Hidden until body.debug is set (toggle by
+     pressing 'l' in the page or appending ?debug=1 to the URL). */
+  #eventlog {
+    display: none; position: fixed; left: 0; right: 0; bottom: 0;
+    max-height: 40vh; overflow: auto; margin: 0; padding: 6px 8px;
+    font: 10px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #cbd5e1; background: rgba(15, 23, 42, 0.92);
+    border-top: 1px solid rgba(148, 163, 184, 0.25); white-space: pre;
+    pointer-events: none; user-select: text;
+  }
+  body.debug #eventlog { display: block; pointer-events: auto; }
 </style>
 </head>
 <body>
@@ -199,6 +225,7 @@
   <div id="transcript"></div>
   <div id="assistant"></div>
   <p id="start-hint">downloading voice model…</p>
+  <pre id="eventlog"></pre>
   <script src="/vendor/ort/ort.min.js"></script>
   <script src="/vendor/vad-web/bundle.min.js"></script>
   <script type="module" src="app.js"></script>

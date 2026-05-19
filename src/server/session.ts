@@ -6,6 +6,7 @@ import { sanitizeForSpeech } from "../audio/sanitize.js";
 import { SentenceChunker } from "../audio/chunker.js";
 import { wrapPcmAsWav } from "../audio/wav.js";
 import type { VoiceConfig } from "../audio/loop.js";
+import { TurnLifecycle } from "./turn-lifecycle.js";
 
 // One WebSession per WebSocket client. Owns its STT/TTS plumbing but
 // piggybacks on the shared pi.sendUserMessage call into the pi agent
@@ -49,7 +50,7 @@ export class WebSession {
   private utteranceRate = 16000;
   private chunker = new SentenceChunker();
   private sawDeltasThisTurn = false;
-  private turnActive = false;
+  private turn = new TurnLifecycle();
   private disposed = false;
 
   constructor(ws: WebSocket, deps: SessionDeps) {
@@ -102,7 +103,7 @@ export class WebSession {
 
   // Forwarded from index.ts event handlers when this session is active.
   onLlmDelta(delta: string): void {
-    if (!this.turnActive) return;
+    if (!this.turn.isActive) return;
     if (!this.sawDeltasThisTurn) {
       this.sawDeltasThisTurn = true;
       this.sendJson({ type: "status", message: "LLM streaming…" });
@@ -120,7 +121,7 @@ export class WebSession {
   }
 
   onTurnEnd(event: unknown): void {
-    if (!this.turnActive) return;
+    if (!this.turn.isActive) return;
     if (this.deps.cfg.ttsChunkSentences && this.sawDeltasThisTurn) {
       for (const sentence of this.chunker.flush()) {
         const s = sanitizeForSpeech(sentence);
@@ -138,13 +139,37 @@ export class WebSession {
   }
 
   onAgentEnd(): void {
-    if (!this.turnActive) return;
-    this.turnActive = false;
-    this.sendJson({ type: "agent_end" });
+    // Always go through end() — we need its classification even when
+    // isActive is false (cancellation window). Only the "natural" end
+    // is forwarded to the client; "cancelled" is swallowed so we don't
+    // surface a stale agent_end for the aborted prior turn.
+    const kind = this.turn.end();
+    this.log(`turn.end → ${kind} (forward=${kind === "natural"})`);
+    if (kind === "natural") this.sendJson({ type: "agent_end" });
+  }
+
+  // Inline LLM-component indicator (reasoning, tool call, tool result).
+  // Sent for UI display only — never spoken, never affects the
+  // assistant text/audio pipeline.
+  onComponent(component: { kind: string; name?: string; ok?: boolean }): void {
+    if (!this.turn.isActive) return;
+    this.sendJson({ type: "component", component });
+  }
+
+  // Re-assert turn active. Called by the connection's sendUserMessage
+  // wrapper AFTER `await session.abort()` drains the cancelled prior
+  // turn (whose agent_end clears turn.isActive) and BEFORE
+  // session.prompt() for the new turn — otherwise the new turn's
+  // text_delta events arrive while turn.isActive is false and are
+  // silently dropped.
+  rearmTurn(): void {
+    this.log(`rearmTurn (isActive=${this.turn.isActive})`);
+    this.turn.rearm();
+    this.sawDeltasThisTurn = false;
   }
 
   get voiceTurnInFlight(): boolean {
-    return this.turnActive;
+    return this.turn.isActive;
   }
 
   get systemPrompt(): string {
@@ -176,11 +201,24 @@ export class WebSession {
         break;
       case "audio_end":
         this.utteranceRate = msg.sampleRate ?? 16000;
+        // Commit to cancellation NOW (not after STT) so the prior
+        // turn's residual events — including a natural agent_end that
+        // happens to fire during the STT window — get dropped. Without
+        // this, the prior turn's stale agent_end is forwarded to the
+        // client, which shows a misleading "(no response)" before the
+        // new turn's response arrives. finishUtterance() will revert
+        // if STT comes back empty.
+        this.log(`audio_end → turn.begin (isActive=${this.turn.isActive})`);
+        this.turn.begin();
         void this.finishUtterance();
         break;
       case "cancel":
         this.tts.cancel();
-        this.turnActive = false;
+        // cancel() (not end()) so any drained agent_end from the
+        // cancelled turn — which may arrive later during the next
+        // utterance's STT window — classifies as "cancelled" and is
+        // dropped instead of forwarded as a stale "(no response)".
+        this.turn.cancel();
         this.sendJson({ type: "status", message: "cancelled" });
         break;
     }
@@ -208,18 +246,22 @@ export class WebSession {
     }
     if (!text) {
       // Empty STT — likely a false-positive from VAD. Do NOT cancel any
-      // in-flight TTS / LLM turn; just drop the audio silently.
+      // in-flight TTS / LLM turn; just drop the audio silently. revert()
+      // undoes the cancellation that audio_end committed pre-STT so the
+      // prior turn (if any) keeps streaming to the client.
       this.sendJson({ type: "status", message: "empty transcription" });
+      this.turn.revert();
       return;
     }
     this.sendJson({ type: "transcript", text });
     // Commit to a new turn: drop in-flight TTS (local sink + client playout)
-    // and reset per-turn state.
+    // and reset per-turn state. turn.begin() was already called at
+    // audio_end — sawDeltasThisTurn reset here so chunker output from a
+    // (now-dropped) prior turn doesn't get attributed to the new one.
     this.tts.cancel();
     this.sendJson({ type: "tts_cancel" });
     this.chunker = new SentenceChunker();
     this.sawDeltasThisTurn = false;
-    this.turnActive = true;
     try {
       await this.deps.sendUserMessage(text);
     } catch (e) {
@@ -227,7 +269,7 @@ export class WebSession {
         type: "error",
         message: `pi.sendUserMessage: ${(e as Error).message}`,
       });
-      this.turnActive = false;
+      this.turn.end();
     }
   }
 

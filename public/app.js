@@ -18,6 +18,12 @@ import {
   ARP_PHASES,
   TARGET_CAPTURE_RATE,
 } from "./state.js";
+import { ensureAudioRunning } from "./audio.js";
+import {
+  formatComponent,
+  reduceAssistant,
+  initialAssistant,
+} from "./components.js";
 
 // === Tunables (ms) ===========================================================
 const HOLD_THRESHOLD_MS = 250;     // press duration that promotes tap → PTT
@@ -27,6 +33,10 @@ const CHIME_TAIL_PAUSE_MS = 200;   // silence after chime before next side-effec
 // tracks dead, but the OS audio-routing reconfigure continues
 // asynchronously — playing anything during that window clips the onset.
 const MIC_OFF_SETTLE_MS = 120;
+// Wait after AudioContext.resume() before scheduling playback. Mobile
+// browsers need a moment for the OS audio session to re-route after
+// being interrupted by a capture-context close.
+const AUDIO_SESSION_RESUME_MS = 80;
 
 // === DOM refs ================================================================
 const orbEl = document.getElementById("orb");
@@ -40,8 +50,75 @@ function setStatus(s) { statusEl.textContent = s; }
 function setBodyState(name, on) { document.body.classList.toggle(name, on); }
 function setMicOn(on) { document.body.classList.toggle("mic-on", on); }
 function setTranscript(s) { transcriptEl.textContent = s; }
-function setAssistant(s) { assistantEl.textContent = s; }
-function appendAssistant(s) { assistantEl.textContent += s; }
+// Render the assistant slot from the {chip, text} model. Called after
+// every assistant-display state update so chip/text changes are
+// reflected atomically (chip and text live in the same element so
+// "replace chip with text" never leaves a stale chip behind).
+let assistantDisplay = initialAssistant;
+function renderAssistant() {
+  assistantEl.textContent = "";
+  if (assistantDisplay.chip) {
+    const chip = document.createElement("span");
+    chip.className = "component-chip";
+    chip.textContent = assistantDisplay.chip;
+    assistantEl.appendChild(chip);
+  }
+  if (assistantDisplay.text) {
+    const span = document.createElement("span");
+    span.className = "assistant-text";
+    span.textContent = assistantDisplay.text;
+    assistantEl.appendChild(span);
+  }
+}
+function updateAssistant(event) {
+  assistantDisplay = reduceAssistant(assistantDisplay, event);
+  renderAssistant();
+}
+
+// === Event log (ring buffer) =================================================
+// Captures every dispatched event + resulting phase/flag transitions and
+// the actions the reducer emitted, with millisecond timestamps relative
+// to page load. Exposed on window.__pilog for in-browser inspection and
+// rendered into the #eventlog DOM element when present. Helps diagnose
+// timing races (stale AGENT_END, late TRANSCRIPT) without a debugger.
+const LOG_CAP = 200;
+const eventLog = [];
+const logT0 = performance.now();
+const logEl = document.getElementById("eventlog");
+function logEvent(entry) {
+  eventLog.push(entry);
+  if (eventLog.length > LOG_CAP) eventLog.shift();
+  if (logEl) {
+    const line = document.createElement("div");
+    line.textContent = formatLogLine(entry);
+    logEl.appendChild(line);
+    while (logEl.childNodes.length > LOG_CAP) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+function formatLogLine(e) {
+  const t = e.t.toFixed(0).padStart(6);
+  const ev = (e.event ?? "").padEnd(18);
+  const phase = e.phase ? `→${e.phase}` : "";
+  const flags = e.flags ?? "";
+  const actions = e.actions?.length ? ` [${e.actions.join(",")}]` : "";
+  const extra = e.note ? ` ${e.note}` : "";
+  return `${t} ${ev}${phase} ${flags}${actions}${extra}`;
+}
+if (typeof window !== "undefined") {
+  window.__pilog = eventLog;
+  // Auto-enable via ?debug=1; toggle live with 'l'.
+  try {
+    if (new URLSearchParams(location.search).get("debug") === "1") {
+      document.body.classList.add("debug");
+    }
+  } catch {}
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "l" && !e.target?.matches?.("input,textarea")) {
+      document.body.classList.toggle("debug");
+    }
+  });
+}
 
 // === Reducer state + driver ==================================================
 let state = initialState;
@@ -49,6 +126,19 @@ function dispatch(event) {
   const prev = state;
   const { state: next, actions } = reduce(prev, event);
   state = next;
+  const flags = [
+    next.thinking ? "T" : "-",
+    next.speaking ? "S" : "-",
+    next.gotText ? "G" : "-",
+    `m=${next.sessionMode[0]}`,
+  ].join("");
+  logEvent({
+    t: performance.now() - logT0,
+    event: event.type,
+    phase: prev.phase !== next.phase ? next.phase : null,
+    flags,
+    actions: actions.map((a) => a.type),
+  });
   applyState(prev, next);
   for (const action of actions) runAction(action);
 }
@@ -80,6 +170,9 @@ function runAction(action) {
     case "WS_FLUSH_VAD":  flushVad(); break;
     case "WS_FLUSH_PTT":  flushPtt(); break;
     case "WORKLET_RESET": playerNode?.port.postMessage({ type: "reset" }); break;
+    case "SHOW_PLACEHOLDER":
+      updateAssistant({ type: "placeholder" });
+      break;
     default:
       console.warn("[driver] unknown action:", action.type);
   }
@@ -196,11 +289,11 @@ if (!window.isSecureContext) {
 // === Chime ===================================================================
 async function playChime(reverse) {
   if (!playerCtx) return;
-  // Await resume — scheduling notes while the context is still ramping
-  // up clips the chime's onset, especially when it's been idle for a bit.
-  if (playerCtx.state === "suspended") {
-    try { await playerCtx.resume(); } catch {}
-  }
+  // Mobile capture-context teardown (releasePttMic / VAD pause) parks
+  // playerCtx in "suspended" or "interrupted"; scheduling oscillators
+  // in either state silently no-ops. ensureAudioRunning resumes and
+  // gives the OS audio session a moment to re-route before we schedule.
+  await ensureAudioRunning(playerCtx, AUDIO_SESSION_RESUME_MS);
   // Blend into the arp if it's running.
   const blend = arp?.active === true;
   const dest = blend ? arp.master : playerCtx.destination;
@@ -651,6 +744,16 @@ function onWsMessage(ev) {
 }
 
 function handleControl(msg) {
+  logEvent({
+    t: performance.now() - logT0,
+    event: `ws:${msg.type}`,
+    note: msg.type === "status" ? msg.message
+        : msg.type === "transcript" ? JSON.stringify((msg.text ?? "").slice(0, 40))
+        : msg.type === "component" ? JSON.stringify(msg.component)
+        : msg.type === "llm_delta" ? `+${(msg.text ?? "").length}b`
+        : msg.type === "llm_text" ? `${(msg.text ?? "").length}b`
+        : "",
+  });
   switch (msg.type) {
     case "hello":
       ttsSampleRate = msg.ttsSampleRate ?? 24000;
@@ -667,14 +770,26 @@ function handleControl(msg) {
       break;
     case "transcript":
       setTranscript(msg.text ?? "");
-      setAssistant("");
+      updateAssistant({ type: "reset" });
       dispatch({ type: "TRANSCRIPT" });
       break;
     case "llm_delta":
-      if (typeof msg.text === "string") appendAssistant(msg.text);
+      if (typeof msg.text === "string" && msg.text.length > 0) {
+        updateAssistant({ type: "delta", text: msg.text });
+        dispatch({ type: "LLM_TEXT" });
+      }
       break;
     case "llm_text":
-      if (typeof msg.text === "string") setAssistant(msg.text);
+      if (typeof msg.text === "string" && msg.text.length > 0) {
+        updateAssistant({ type: "text", text: msg.text });
+        dispatch({ type: "LLM_TEXT" });
+      }
+      break;
+    case "component":
+      if (msg.component) {
+        updateAssistant({ type: "component", value: formatComponent(msg.component) });
+        dispatch({ type: "COMPONENT" });
+      }
       break;
     case "tts_start":
       dispatch({ type: "TTS_START" });

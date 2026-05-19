@@ -185,6 +185,31 @@ async function main(): Promise<void> {
     return parts.join("");
   };
 
+  // Split an assistant message into its text answer and the bracket-tagged
+  // structural parts (thinking, toolCall, ...). The two are logged on
+  // separate lines so it's obvious whether the model produced a
+  // user-visible answer at all, vs. only reasoning / tool calls.
+  const splitAssistantContent = (
+    content: unknown,
+  ): { answer: string; structure: string } => {
+    if (typeof content === "string") return { answer: content, structure: "" };
+    if (!Array.isArray(content)) {
+      return { answer: "", structure: JSON.stringify(content) };
+    }
+    const answerParts: string[] = [];
+    const structureParts: string[] = [];
+    for (const p of content) {
+      if (!p || typeof p !== "object") continue;
+      const t = (p as { type?: string }).type;
+      if (t === "text" && typeof (p as { text?: unknown }).text === "string") {
+        answerParts.push((p as { text: string }).text);
+      } else {
+        structureParts.push(`[${t ?? "part"}]`);
+      }
+    }
+    return { answer: answerParts.join(""), structure: structureParts.join("") };
+  };
+
   const logEvent = (kind: string, payload: unknown): void => {
     if (!logTranscript) return;
     let body: string;
@@ -232,9 +257,14 @@ async function main(): Promise<void> {
                 return;
               case "thinking_end":
                 if (typeof ame.content === "string") logEvent("thinking", ame.content);
+                ws?.onComponent({ kind: "thinking" });
                 return;
               case "toolcall_end":
                 logEvent("toolcall", ame.toolCall);
+                ws?.onComponent({
+                  kind: "tool_call",
+                  name: (ame.toolCall as { name?: string } | undefined)?.name,
+                });
                 return;
               case "error":
                 logEvent("ame_error", { reason: ame.reason, error: ame.error });
@@ -245,7 +275,10 @@ async function main(): Promise<void> {
           case "message_end": {
             const msg = event.message;
             if (msg?.role === "assistant") {
-              logEvent("assistant", stringifyContent(msg.content));
+              const { answer, structure } = splitAssistantContent(msg.content);
+              if (structure) logEvent("assistant_structure", structure);
+              if (answer) logEvent("assistant_answer", answer);
+              else logEvent("assistant_answer", "<empty — no text block produced>");
             } else if (msg?.role === "tool" || msg?.role === "toolResult") {
               logEvent("tool_result", {
                 toolCallId: msg.toolCallId,
@@ -263,6 +296,11 @@ async function main(): Promise<void> {
               isError: event.isError,
               result: event.result,
             });
+            webSession?.onComponent({
+              kind: "tool_result",
+              name: typeof event.toolName === "string" ? event.toolName : undefined,
+              ok: !event.isError,
+            });
             return;
           case "turn_end":
             ws?.onTurnEnd(event);
@@ -276,14 +314,11 @@ async function main(): Promise<void> {
       const sendUserMessage = async (text: string): Promise<void> => {
         logEvent("submit", text);
         try {
-          // Voice is push-to-talk: if the user speaks again while the agent is
-          // still streaming the previous turn, hard-cancel the in-flight model
-          // call (abort waits for idle) and then send the new prompt fresh.
-          // steer() would only queue a soft interjection without aborting.
           if (session.isStreaming) {
             logger("aborting in-flight turn for new voice prompt");
             await session.abort();
           }
+          webSession?.rearmTurn();
           await session.prompt(text);
         } catch (e) {
           logger(`session.prompt error: ${(e as Error).message}`, "error");

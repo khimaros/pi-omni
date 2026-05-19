@@ -53,6 +53,20 @@ export const initialState = Object.freeze({
   // against sessionMode — if the user toggled away while the open was
   // running, we drop the result and the driver runs the close.
   pendingOpen: null, // null | "live" | "ptt"
+  // True once any LLM text (delta or full) has streamed for the current
+  // turn. Reset on TRANSCRIPT (new turn boundary). On AGENT_END, if
+  // false, the reducer emits SHOW_PLACEHOLDER so the driver can render
+  // a "(no response)" hint in the assistant slot — otherwise an empty
+  // turn (only reasoning / tool calls) looks like a hung UI.
+  gotText: false,
+  // True once the new turn has shown ANY activity — a COMPONENT
+  // (thinking/tool) or an LLM_TEXT. Reset on TRANSCRIPT. Used by
+  // AGENT_END to distinguish a stale prior-turn agent_end (no
+  // activity yet → suppress placeholder) from a real empty-of-text
+  // turn (activity but no text → show placeholder). Workaround for
+  // a server-side race where the prior turn's drained agent_end
+  // occasionally leaks through TurnLifecycle suppression.
+  sawTurnActivity: false,
   errorMessage: null,
 });
 
@@ -297,9 +311,39 @@ const HANDLERS = {
     // If the user has already begun a new utterance (barge-in landed us
     // in recording), a late TRANSCRIPT from the previous turn must not
     // clobber the recording phase. Track thinking so AGENT_END can
-    // still resolve cleanly when it arrives.
-    const next = { ...state, thinking: true };
+    // still resolve cleanly when it arrives. gotText/sawTurnActivity
+    // reset here so the new turn's empty-response detection and stale-
+    // agent_end guard both start clean.
+    const next = {
+      ...state, thinking: true, gotText: false, sawTurnActivity: false,
+    };
     if (state.phase === "recording") return { state: next, actions: [] };
+    return withPhase(next, "thinking");
+  },
+
+  COMPONENT(state) {
+    // Server emitted a thinking_end / tool_call / tool_result for the
+    // current turn. Pure activity signal — no phase change, no actions.
+    // Used by AGENT_END to gate the placeholder.
+    if (state.sawTurnActivity) return { state, actions: [] };
+    return { state: { ...state, sawTurnActivity: true }, actions: [] };
+  },
+
+  LLM_TEXT(state) {
+    // Unambiguous evidence that the current turn is producing — set
+    // the thinking flag and, if the phase has regressed (e.g., a stale
+    // AGENT_END from a cancelled prior turn slipped through and bumped
+    // us to paused/listening), restore "thinking". Phases that already
+    // reflect an active turn (thinking / synthesizing / speaking) are
+    // left alone so we don't undo a more advanced phase.
+    const next = {
+      ...state, gotText: true, thinking: true, sawTurnActivity: true,
+    };
+    const advanced =
+      state.phase === "thinking" ||
+      state.phase === "synthesizing" ||
+      state.phase === "speaking";
+    if (advanced) return { state: next, actions: [] };
     return withPhase(next, "thinking");
   },
 
@@ -330,9 +374,23 @@ const HANDLERS = {
   },
 
   AGENT_END(state) {
+    // Placeholder ("(no response)") only when the turn legitimately
+    // ended without producing text. "Legitimately" = we saw activity
+    // for THIS turn (a component or text delta). Without that signal,
+    // the agent_end is almost certainly stale (prior turn's drained
+    // end leaking past server-side suppression) and must not surface.
+    const isEmptyTurn = state.sawTurnActivity && !state.gotText;
+    const placeholderActions = isEmptyTurn ? [{ type: "SHOW_PLACEHOLDER" }] : [];
     const next = { ...state, thinking: false };
-    if (next.speaking) return { state: next, actions: [] };
-    return withPhase(next, restingPhase(next));
+    if (next.speaking) return { state: next, actions: placeholderActions };
+    // If we're already waiting for a new turn (recording the user, or
+    // mid-STT for the next utterance after a barge-in), don't regress
+    // phase — a stale AGENT_END from a cancelled turn would otherwise
+    // strand the UI in paused/listening until the next event lands.
+    if (state.phase === "transcribing" || state.phase === "recording") {
+      return { state: next, actions: placeholderActions };
+    }
+    return withPhase(next, restingPhase(next), placeholderActions);
   },
 
   STATUS_EMPTY(state) {
