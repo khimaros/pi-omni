@@ -182,82 +182,23 @@
     word-wrap: break-word;
     opacity: 0.95;
   }
-  #start-overlay {
-    position: fixed; inset: 0;
-    background: var(--bg);
-    /* Mirror the body's column flex so #start-orb sits at the same
-       vertical position as #orb behind it — no jump on overlay hide. */
-    display: flex; flex-direction: column;
-    z-index: 10;
-    padding: max(env(safe-area-inset-top), 16px) 16px max(env(safe-area-inset-bottom), 16px);
-  }
-  #start-overlay.hidden { display: none; }
-  /* Placeholders match the heights/margins of #status, #transcript,
-     #assistant so flex:1 #start-orb-slot centers at the same Y as #orb. */
-  #start-overlay .status-slot { min-height: 18px; margin-bottom: 8px; }
-  #start-overlay .orb-slot {
-    flex: 1;
-    display: flex; align-items: center; justify-content: center;
-  }
-  #start-overlay .transcript-slot { min-height: 22px; margin-top: 12px; }
-  #start-overlay .assistant-slot {
-    min-height: 60px; margin-top: 8px;
-    display: flex; flex-direction: column; align-items: center;
-  }
-  #start-orb {
-    cursor: pointer;
-    touch-action: none;
-    -webkit-touch-callout: none;
-    -webkit-user-select: none;
-    user-select: none;
-    transition: opacity 120ms;
-  }
-  #start-orb.disabled {
-    opacity: 0.45;
-    cursor: progress;
-  }
-  /* Reuse the main orb styling so the start orb is visually identical
-     (and lines up with the main orb once the overlay hides). */
-  #start-orb .dot {
-    width: 140px; height: 140px;
-    border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    background: radial-gradient(circle at 30% 30%, #333, #111 70%);
-    box-shadow: 0 0 0 2px #222 inset, 0 0 40px rgba(0,0,0,0.5);
-    transition: box-shadow 200ms ease-out;
-  }
-  /* Hover tinting lives in the .g-wave i rule above (only glyph in use). */
-  #start-overlay p {
+  /* Pre-start disabled look on the main orb (during prefetch). */
+  #orb.disabled .dot { opacity: 0.45; cursor: progress; }
+  #start-hint {
     color: var(--dim); margin: 8px 0 0; max-width: 280px; text-align: center;
-    font-size: 13px;
+    font-size: 13px; align-self: center;
   }
-  #progress {
-    width: 240px; height: 4px; border-radius: 2px;
-    background: #222; overflow: hidden;
-  }
-  #progress .bar {
-    height: 100%; width: 0; background: var(--agent);
-    transition: width 120ms ease-out;
-  }
-  #progress.hidden { visibility: hidden; }
+  /* Keep layout intact when hidden — the orb is flex:1 and would
+     re-center if this element collapsed. */
+  #start-hint.hidden { visibility: hidden; }
 </style>
 </head>
 <body>
-  <div id="start-overlay">
-    <div class="status-slot"></div>
-    <div class="orb-slot">
-      <div id="start-orb" class="disabled orb-glyph-css glyph-wave"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
-    </div>
-    <div class="transcript-slot"></div>
-    <div class="assistant-slot">
-      <div id="progress" class="hidden"><div class="bar"></div></div>
-      <p id="start-hint">downloading voice model…</p>
-    </div>
-  </div>
   <div id="status">paused</div>
-  <div id="orb" class="orb-glyph-css glyph-wave"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
+  <div id="orb" class="disabled orb-glyph-css glyph-wave"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
   <div id="transcript"></div>
   <div id="assistant"></div>
+  <p id="start-hint">downloading voice model…</p>
   <script src="/vendor/ort/ort.min.js"></script>
   <script src="/vendor/vad-web/bundle.min.js"></script>
   <script type="module" src="app.js"></script>

@@ -54,7 +54,7 @@ test("TAP from pause begins opening live (phase stays paused until OPEN_DONE)", 
   assert.equal(state.sessionMode, "live");
   assert.equal(state.phase, "paused"); // glow not lit until mic ready
   assert.equal(state.pendingOpen, "live");
-  assert.deepEqual(actionTypes(actions), ["OPEN_LIVE", "HIDE_OVERLAY"]);
+  assert.deepEqual(actionTypes(actions), ["OPEN_LIVE"]);
 });
 
 test("OPEN_DONE(live) after TAP transitions to listening", () => {
@@ -147,7 +147,7 @@ test("HOLD from pause enters PTT immediately (phase=recording, overlay hides)", 
   assert.equal(state.sessionMode, "ptt");
   assert.equal(state.phase, "recording");
   assert.equal(state.pttHeld, true);
-  assert.deepEqual(actionTypes(actions), ["HIDE_OVERLAY", "OPEN_PTT"]);
+  assert.deepEqual(actionTypes(actions), ["OPEN_PTT"]);
   // OPEN_PTT carries fromLive=false from pause.
   const openPtt = actions.find((a) => a.type === "OPEN_PTT");
   assert.equal(openPtt.fromLive, false);

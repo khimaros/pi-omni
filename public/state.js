@@ -146,7 +146,7 @@ const HANDLERS = {
       // mic is actually open — OPEN_DONE flips us to listening.
       return {
         state: { ...state, sessionMode: "live", pendingOpen: "live" },
-        actions: [{ type: "OPEN_LIVE" }, { type: "HIDE_OVERLAY" }],
+        actions: [{ type: "OPEN_LIVE" }],
       };
     }
     // sessionMode === "live": close to pause.
@@ -196,7 +196,6 @@ const HANDLERS = {
     };
     return withPhase(next, "recording", [
       ...cancelActions,
-      { type: "HIDE_OVERLAY" },
       { type: "OPEN_PTT", fromLive },
     ]);
   },

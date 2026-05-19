@@ -29,15 +29,11 @@ const CHIME_TAIL_PAUSE_MS = 200;   // silence after chime before next side-effec
 const MIC_OFF_SETTLE_MS = 120;
 
 // === DOM refs ================================================================
-const startOverlay = document.getElementById("start-overlay");
-const startOrb = document.getElementById("start-orb");
 const orbEl = document.getElementById("orb");
 const orbDot = orbEl.querySelector(".dot");
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 const assistantEl = document.getElementById("assistant");
-const progressEl = document.getElementById("progress");
-const progressBar = progressEl.querySelector(".bar");
 const startHint = document.getElementById("start-hint");
 
 function setStatus(s) { statusEl.textContent = s; }
@@ -84,7 +80,6 @@ function runAction(action) {
     case "WS_FLUSH_VAD":  flushVad(); break;
     case "WS_FLUSH_PTT":  flushPtt(); break;
     case "WORKLET_RESET": playerNode?.port.postMessage({ type: "reset" }); break;
-    case "HIDE_OVERLAY":  startOverlay.classList.add("hidden"); break;
     default:
       console.warn("[driver] unknown action:", action.type);
   }
@@ -111,8 +106,7 @@ let serverWantsAutoStart = false;
 let prefetchDone = false;
 let started = false;
 let startPromise = null;
-let holdTimer = null;       // start-orb hold timer
-let mainHoldTimer = null;   // main-orb hold timer
+let holdTimer = null;       // promotes a press to HOLD after HOLD_THRESHOLD_MS
 
 // === Prefetch ================================================================
 const PREFETCH = [
@@ -129,15 +123,13 @@ function updateProgress() {
     else allKnown = false;
   }
   if (total > 0) {
-    const pct = Math.min(100, Math.round((loaded / total) * 100));
-    progressBar.style.width = pct + "%";
     const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+    const pct = Math.min(100, Math.round((loaded / total) * 100));
     startHint.textContent = allKnown
-      ? `downloading voice model… ${mb(loaded)} / ${mb(total)} MB`
+      ? `downloading voice model… ${pct}% (${mb(loaded)} / ${mb(total)} MB)`
       : `downloading voice model… ${mb(loaded)} MB`;
   }
   if (prefetchState.every((s) => s.done)) {
-    progressEl.classList.add("hidden");
     const failures = prefetchState
       .map((s, i) => (s.failed ? PREFETCH[i] : null))
       .filter(Boolean);
@@ -149,7 +141,7 @@ function updateProgress() {
       return;
     }
     startHint.textContent = "push to talk or tap to toggle voice detection";
-    startOrb.classList.remove("disabled");
+    orbEl.classList.remove("disabled");
     prefetchDone = true;
     maybeAutoStart();
   }
@@ -159,9 +151,7 @@ function maybeAutoStart() {
   if (!serverWantsAutoStart || !prefetchDone || started) return;
   started = true;
   start()
-    .then(() => {
-      startOverlay.classList.add("hidden");
-    })
+    .then(() => { startHint.classList.add("hidden"); })
     .catch((e) => {
       console.warn("[autostart] failed:", e?.message ?? e);
       started = false;
@@ -199,9 +189,7 @@ if (!window.isSecureContext) {
     `insecure origin (${location.origin}) — needs HTTPS or localhost. ` +
     `Tunnel: ssh -L ${location.port}:localhost:${location.port} <host>`;
   document.body.classList.add("error");
-  progressEl.classList.add("hidden");
 } else {
-  progressEl.classList.remove("hidden");
   PREFETCH.forEach((_, i) => prefetchOne(i));
 }
 
@@ -435,59 +423,56 @@ function flushPtt() {
 }
 
 // === Pointer handlers ========================================================
-startOrb.addEventListener("pointerdown", (e) => {
-  if (startOrb.classList.contains("disabled") || started) return;
+// Single gesture target: the main orb handles both first-press
+// bring-up and ongoing TAP/HOLD. First press synchronously creates +
+// resumes the AudioContext inside the gesture frame (Firefox Android
+// and Safari iOS both reject deferred resume() outside a gesture), then
+// kicks off the async start() for worklet/WS/VAD setup.
+orbDot.addEventListener("pointerdown", (e) => {
+  if (orbEl.classList.contains("disabled")) return;
   if (document.body.classList.contains("reconnecting")) return;
+  if (state.sessionMode === "ptt") return; // already holding
   e.preventDefault();
-  try { startOrb.setPointerCapture(e.pointerId); } catch {}
-  startOrb.classList.add("disabled");
-  started = true;
+  try { orbDot.setPointerCapture(e.pointerId); } catch {}
+  if (!started) {
+    ensurePlayerCtx();
+    started = true;
+    startHint.classList.add("hidden");
+    startPromise = start().catch((err) => {
+      console.error("[start] failed:", err);
+      setStatus(`error: ${err.message ?? err}`);
+      setBodyState("error", true);
+      started = false;
+      startHint.classList.remove("hidden");
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+      throw err;
+    });
+  }
   holdTimer = setTimeout(() => { holdTimer = null; dispatch({ type: "HOLD" }); }, HOLD_THRESHOLD_MS);
-  startPromise = start().catch((err) => {
-    console.error("[start] failed:", err);
-    setStatus(`error: ${err.message ?? err}`);
-    setBodyState("error", true);
-    startOrb.classList.remove("disabled");
-    started = false;
-    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
-    throw err;
-  });
 });
 
-async function onStartOrbRelease() {
+async function onOrbUp() {
   if (holdTimer) {
     clearTimeout(holdTimer);
     holdTimer = null;
-    if (startPromise) { try { await startPromise; } catch { return; } }
     dispatch({ type: "TAP" });
     return;
   }
   if (state.sessionMode === "ptt") dispatch({ type: "RELEASE" });
 }
-startOrb.addEventListener("pointerup", onStartOrbRelease);
-startOrb.addEventListener("pointercancel", onStartOrbRelease);
-
-orbDot.addEventListener("pointerdown", (e) => {
-  if (!started || state.sessionMode === "ptt") return;
-  if (document.body.classList.contains("reconnecting")) return;
-  e.preventDefault();
-  try { orbDot.setPointerCapture(e.pointerId); } catch {}
-  mainHoldTimer = setTimeout(() => { mainHoldTimer = null; dispatch({ type: "HOLD" }); }, HOLD_THRESHOLD_MS);
-});
-
-function onMainOrbUp() {
-  if (mainHoldTimer) {
-    clearTimeout(mainHoldTimer);
-    mainHoldTimer = null;
-    dispatch({ type: "TAP" });
-    return;
-  }
-  if (state.sessionMode === "ptt") dispatch({ type: "RELEASE" });
-}
-orbDot.addEventListener("pointerup", onMainOrbUp);
-orbDot.addEventListener("pointercancel", onMainOrbUp);
+orbDot.addEventListener("pointerup", onOrbUp);
+orbDot.addEventListener("pointercancel", onOrbUp);
 
 // === start() bring-up ========================================================
+// Create + sync-resume the player AudioContext. Must be called from a
+// real user gesture (pointerdown handler) or mobile browsers will
+// leave the context suspended and silently drop chime/TTS playback.
+function ensurePlayerCtx() {
+  if (playerCtx) return;
+  playerCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+  try { playerCtx.resume(); } catch {}
+}
+
 async function start() {
   if (!window.isSecureContext) {
     throw new Error(
@@ -495,8 +480,7 @@ async function start() {
       `localhost. Tunnel with: ssh -L ${location.port}:localhost:${location.port} <host>`,
     );
   }
-  playerCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-  try { await playerCtx.resume(); } catch {}
+  ensurePlayerCtx();
   await playerCtx.audioWorklet.addModule("worklet.js");
   playerNode = new AudioWorkletNode(playerCtx, "pcm-player");
   playerNode.connect(playerCtx.destination);
