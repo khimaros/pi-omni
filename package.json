@@ -1,6 +1,6 @@
 {
   "name": "@khimaros/pi-omni",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "pi.dev extension: push-to-talk voice mode (STT + TTS via OpenAI-compatible endpoint)",
   "keywords": [
     "pi-package"
