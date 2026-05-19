@@ -125,22 +125,38 @@ async function main(): Promise<void> {
       `pi session ready: ${session.model ? `${session.model.provider}/${session.model.id}` : "(no model)"}`,
     );
 
-    // Append the voice system prompt to the session's base system prompt so
-    // every turn carries it implicitly — instead of prepending it as a fake
-    // user message before each utterance. agent-session resets state.systemPrompt
-    // to _baseSystemPrompt at the start of every prompt() (see agent-session.js
-    // ~line 797), so we mutate the base directly. The session has no public
-    // setter for this; pi-coding-agent's documented path is a before_agent_start
-    // extension, which standalone pi-omni-web doesn't have machinery for.
+    // Append the voice system prompt LAST, after every other extension has
+    // had a chance to mutate it. Mutating _baseSystemPrompt directly doesn't
+    // work because earlier-loaded extensions (pi-evolve, etc.) implement
+    // before_agent_start by REPLACING event.systemPrompt with their own
+    // merged value — dropping anything we'd appended to the base. We wrap
+    // _extensionRunner.emitBeforeAgentStart so our append runs after the
+    // full handler chain. See pi-evolve/src/extension/index.ts for the
+    // standard before_agent_start "append to event.systemPrompt" pattern.
     const voicePrompt = cfg.voiceSystemPrompt?.trim();
     if (voicePrompt) {
-      const s = session as unknown as {
-        _baseSystemPrompt: string;
-        agent: { state: { systemPrompt: string } };
+      const runner = (session as unknown as {
+        _extensionRunner: {
+          emitBeforeAgentStart: (
+            prompt: string,
+            images: unknown,
+            systemPrompt: string,
+            opts: unknown,
+          ) => Promise<
+            { messages?: unknown[]; systemPrompt?: string } | undefined
+          >;
+        };
+      })._extensionRunner;
+      const orig = runner.emitBeforeAgentStart.bind(runner);
+      runner.emitBeforeAgentStart = async (prompt, images, systemPrompt, opts) => {
+        const result = await orig(prompt, images, systemPrompt, opts);
+        const base = result?.systemPrompt ?? systemPrompt;
+        return {
+          messages: result?.messages,
+          systemPrompt: `${base}\n\n${voicePrompt}`,
+        };
       };
-      s._baseSystemPrompt = `${s._baseSystemPrompt}\n\n${voicePrompt}`;
-      s.agent.state.systemPrompt = s._baseSystemPrompt;
-      connLog(`appended voice system prompt (${voicePrompt.length} chars)`);
+      connLog(`will append voice system prompt (${voicePrompt.length} chars) after extensions`);
     }
 
     try {

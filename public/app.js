@@ -24,6 +24,7 @@ import {
   reduceAssistant,
   initialAssistant,
 } from "./components.js";
+import { createPtt } from "./ptt.js";
 
 // === Tunables (ms) ===========================================================
 const HOLD_THRESHOLD_MS = 250;     // press duration that promotes tap → PTT
@@ -191,10 +192,6 @@ let vadBuffer = [];
 // Complete utterance handed to us by the VAD library on onSpeechEnd —
 // preferred over vadBuffer in the natural-end case (no leading-consonant clip).
 let vadEndAudio = null;
-// Did the most recent WS_FLUSH_PTT actually have data? Read by closePtt
-// to inform the reducer via CLOSE_DONE.hadAudio.
-let pttHadAudio = false;
-
 let serverWantsAutoStart = false;
 let prefetchDone = false;
 let started = false;
@@ -441,7 +438,7 @@ async function openPtt(fromLive) {
     if (state.sessionMode !== "ptt") return;
     await ensurePttMic();
     if (pttCtx.state === "suspended") { try { await pttCtx.resume(); } catch {} }
-    pttBuffer = [];
+    ptt.reset();
     dispatch({ type: "OPEN_DONE", kind: "ptt" });
   } catch (e) {
     console.error("[ptt] mic init failed:", e);
@@ -456,11 +453,7 @@ async function closeLive() {
 }
 
 async function closePtt() {
-  const hadAudio = pttHadAudio;
-  pttHadAudio = false;
-  await releasePttMic();
-  await playChimeAndPause(true);
-  dispatch({ type: "CLOSE_DONE", hadAudio });
+  await ptt.close();
 }
 
 async function releaseLiveMic() {
@@ -505,14 +498,7 @@ function flushVad() {
 }
 
 function flushPtt() {
-  const total = pttBuffer.reduce((n, a) => n + a.length, 0);
-  if (total === 0) { pttHadAudio = false; return; }
-  const flat = new Float32Array(total);
-  let off = 0;
-  for (const chunk of pttBuffer) { flat.set(chunk, off); off += chunk.length; }
-  pttBuffer = [];
-  sendUtterance(flat);
-  pttHadAudio = true;
+  ptt.flush();
 }
 
 // === Pointer handlers ========================================================
@@ -639,7 +625,12 @@ let pttCtx = null;
 let pttStream = null;
 let pttSource = null;
 let pttProcessor = null;
-let pttBuffer = [];
+const ptt = createPtt({
+  sendUtterance: (f32) => sendUtterance(f32),
+  releaseMic: () => releasePttMic(),
+  playChimeAndPause: () => playChimeAndPause(true),
+  dispatch: (event) => dispatch(event),
+});
 
 async function ensurePttMic() {
   if (pttCtx) return;
@@ -658,7 +649,7 @@ async function ensurePttMic() {
   pttProcessor = pttCtx.createScriptProcessor(2048, 1, 1);
   pttProcessor.onaudioprocess = (e) => {
     if (!state.pttHeld) return;
-    pttBuffer.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    ptt.push(new Float32Array(e.inputBuffer.getChannelData(0)));
   };
   pttSource.connect(pttProcessor);
   pttProcessor.connect(pttCtx.destination);
