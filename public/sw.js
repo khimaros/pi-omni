@@ -1,4 +1,4 @@
-const CACHE_NAME = 'pi-omni-v1';
+const CACHE_NAME = 'pi-omni-v2';
 const ASSETS = [
   '/',
   '/index.html',
@@ -11,6 +11,8 @@ const ASSETS = [
   '/icon.png',
   '/icon-192.png',
   '/icon-512.png',
+  '/icon-192-maskable.png',
+  '/icon-512-maskable.png',
   '/manifest.json'
 ];
 
