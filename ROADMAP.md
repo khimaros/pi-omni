@@ -16,6 +16,7 @@
 ## done
 
 ```
+[x] convert to PWA with a premium icon
 [x] replace energy VAD with Silero-WASM for more robust speech detection
 [x] move AEC3 into the browser (wasm-pack --target web) for the web UI path
 [x] push-to-talk /omni (tap to start, tap to stop)

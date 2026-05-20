@@ -62,6 +62,14 @@ PI_VOICE_LLM_MODEL=qwen3-32b pi-omni-web
 
 then open <http://127.0.0.1:4962>.
 
+### pwa installation
+
+the web UI is a Progressive Web App (PWA). you can "install" it to your home screen or desktop for a native-like experience:
+1. open the URL in a supported browser (Chrome, Safari, Edge).
+2. look for the "Install" icon in the address bar or select "Add to Home Screen" from the browser menu.
+3. the app will appear on your device with a premium waveform icon.
+
+
 ### from a source checkout
 
 ```bash

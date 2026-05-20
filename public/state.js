@@ -67,6 +67,10 @@ export const initialState = Object.freeze({
   // a server-side race where the prior turn's drained agent_end
   // occasionally leaks through TurnLifecycle suppression.
   sawTurnActivity: false,
+  // True if the live mic is currently open at the hardware level. Used
+  // to defer hardware release (CLOSE_LIVE) when the user pauses during
+  // an active turn, avoiding OS-level audio glitches.
+  micOpen: false,
   errorMessage: null,
 });
 
@@ -106,6 +110,14 @@ function withPhase(state, newPhase, extraActions = []) {
   const arpActions = [];
   if (!wasArp && isArp) arpActions.push({ type: "ARP_START" });
   else if (wasArp && !isArp) arpActions.push({ type: "ARP_STOP" });
+
+  // Deferred mic release: if we just moved to a resting phase while in
+  // pause mode, and the mic is still open, close it now.
+  const isActive = isArp || newPhase === "speaking";
+  if (state.sessionMode === "pause" && state.micOpen && !isActive) {
+    extraActions.push({ type: "RELEASE_MIC" });
+  }
+
   return {
     state: { ...state, phase: newPhase },
     actions: [...arpActions, ...extraActions],
@@ -156,6 +168,14 @@ const HANDLERS = {
   TAP(state) {
     if (state.sessionMode === "ptt") return { state, actions: [] };
     if (state.sessionMode === "pause") {
+      if (state.micOpen) {
+        // Hardware already open (deferred release)! Skip the heavy async
+        // open, just flip session mode and play a quick feedback chime.
+        const next = { ...state, sessionMode: "live" };
+        const actions = [{ type: "PLAY_CHIME", reverse: false }];
+        if (state.phase === "paused") return withPhase(next, "listening", actions);
+        return { state: next, actions };
+      }
       // Begin opening live mode. Phase stays paused (no glow) until the
       // mic is actually open — OPEN_DONE flips us to listening.
       return {
@@ -185,9 +205,11 @@ const HANDLERS = {
       pendingClose: wasVadSpeaking ? "transcribing" : null,
     };
     if (midTurn) {
+      // Deferred release: play chime now, release hardware later (once
+      // the turn ends and phase returns to resting).
       return {
         state: next,
-        actions: [...flushActions, { type: "CLOSE_LIVE" }],
+        actions: [...flushActions, { type: "PLAY_CHIME", reverse: true }],
       };
     }
     return withPhase(next, "paused", [...flushActions, { type: "CLOSE_LIVE" }]);
@@ -242,8 +264,11 @@ const HANDLERS = {
       // User toggled away while opening — driver will run the close.
       return { state: { ...state, pendingOpen: null }, actions: [] };
     }
-    const next = { ...state, pendingOpen: null };
-    if (kind === "live") return withPhase(next, "listening");
+    const next = { ...state, pendingOpen: null, micOpen: kind === "live" };
+    if (kind === "live") {
+      if (state.phase === "paused") return withPhase(next, "listening");
+      return { state: next, actions: [] };
+    }
     if (kind === "ptt") {
       return {
         state: next,
@@ -266,7 +291,7 @@ const HANDLERS = {
 
   CLOSE_DONE(state, { hadAudio = true } = {}) {
     const target = state.pendingClose;
-    const next = { ...state, pendingClose: null };
+    const next = { ...state, pendingClose: null, micOpen: false };
     // Only advance if we're still at "paused" — the server may have
     // raced ahead (transcript / tts_start / pcm_first) while the mic-
     // close + chime were running. In that case the more advanced phase
@@ -280,6 +305,7 @@ const HANDLERS = {
   // ─── VAD ─────────────────────────────────────────────────────────
 
   VAD_SPEECH_START(state) {
+    if (state.sessionMode === "pause") return { state, actions: [] };
     // Barge-in: cancel any in-flight server turn (TTS playback OR LLM
     // loop) before opening the new utterance.
     const { state: cancelled, actions: cancelActions } = cancelInFlight(state);
@@ -291,6 +317,7 @@ const HANDLERS = {
   },
 
   VAD_SPEECH_END(state) {
+    if (state.sessionMode === "pause") return { state, actions: [] };
     const next = { ...state, vadSpeaking: false };
     return withPhase(next, "transcribing", [
       { type: "WS_FLUSH_VAD" },
@@ -299,6 +326,7 @@ const HANDLERS = {
   },
 
   VAD_MISFIRE(state) {
+    if (state.sessionMode === "pause") return { state, actions: [] };
     const next = { ...state, vadSpeaking: false };
     if (next.speaking) return withPhase(next, "speaking");
     if (next.thinking) return withPhase(next, "thinking");

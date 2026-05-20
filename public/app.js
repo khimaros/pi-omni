@@ -165,6 +165,8 @@ function runAction(action) {
     case "OPEN_PTT":      openPtt(action.fromLive); break;
     case "CLOSE_LIVE":    closeLive(); break;
     case "CLOSE_PTT":     closePtt(); break;
+    case "PLAY_CHIME":    playChimeAndPause(action.reverse); break;
+    case "RELEASE_MIC":   releaseMicAction(); break;
     case "ARP_START":     arp?.start(); break;
     case "ARP_STOP":      arp?.stop(); break;
     case "WS_SEND":       wsSendJson(action.msg); break;
@@ -452,6 +454,11 @@ async function closeLive() {
   dispatch({ type: "CLOSE_DONE", hadAudio: true });
 }
 
+async function releaseMicAction() {
+  await releaseLiveMic();
+  dispatch({ type: "CLOSE_DONE", hadAudio: true });
+}
+
 async function closePtt() {
   await ptt.close();
 }
@@ -578,6 +585,7 @@ async function initMic() {
   }
   setStatus("loading VAD model…");
   micVad = await window.vad.MicVAD.new({
+    audioContext: playerCtx,
     model: "v5",
     baseAssetPath: "/vendor/vad-web/",
     onnxWASMBasePath: "/vendor/ort/",
