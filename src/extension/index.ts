@@ -134,7 +134,7 @@ export default async function (pi: AnyExtensionAPI): Promise<void> {
         port,
         logger: (m, l) =>
           process.stderr.write(`[pi-omni] web ${l ?? "info"}: ${m}\n`),
-        makeSession: (ws, logger) => {
+        makeSession: (ws, logger, requestedSessionId) => {
           if (webSession) {
             try {
               webSession.dispose();

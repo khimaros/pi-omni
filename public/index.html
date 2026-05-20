@@ -18,6 +18,11 @@
     --dim: #8a8294;
     --agent: #a7f3d0;       /* pastel mint — assistant / speaking */
     --user:  #bfdbfe;       /* pastel sky — user / listening + recording */
+    --listening: #f0f0fa;
+    --transcribing: #d8b4fe;
+    --thinking: #fde68a;
+    --synthesizing: #a5f3fc;
+    --error: #fda4af;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -33,10 +38,11 @@
   }
   #status {
     color: var(--dim);
-    font-size: 13px;
+    font-size: 14px;
     text-align: center;
     min-height: 18px;
     margin-bottom: 8px;
+    transition: color 200ms ease-out;
   }
   #orb {
     flex: 1;
@@ -144,24 +150,31 @@
   body.listening #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 50px 2px rgba(240,240,250,0.4);
   }
+  body.listening #status { color: var(--listening); }
   body.recording #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 6px rgba(191,219,254,0.85);
   }
+  body.recording #status { color: var(--user); }
   body.transcribing #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(216,180,254,0.55);
   }
+  body.transcribing #status { color: var(--transcribing); }
   body.thinking #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(253,230,138,0.55);
   }
+  body.thinking #status { color: var(--thinking); }
   body.synthesizing #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(165,243,252,0.55);
   }
+  body.synthesizing #status { color: var(--synthesizing); }
   body.speaking #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(167,243,208,0.55);
   }
+  body.speaking #status { color: var(--agent); }
   body.error #orb .dot {
     box-shadow: 0 0 0 2px #222 inset, 0 0 60px 4px rgba(253,164,175,0.6);
   }
+  body.error #status { color: var(--error); }
   /* While the WS is down both orbs ignore input (handlers early-return on
      body.reconnecting); the dim + progress cursor signals that. */
   body.reconnecting #orb .dot,
@@ -170,6 +183,7 @@
     cursor: progress;
     pointer-events: none;
   }
+  body.reconnecting #status { color: var(--dim); }
   #transcript {
     color: var(--user);
     font-size: 14px;
@@ -223,9 +237,157 @@
     pointer-events: none; user-select: text;
   }
   body.debug #eventlog { display: block; pointer-events: auto; }
+
+  /* Sessions UI */
+  #session-manager-ui {
+    position: absolute;
+    top: max(env(safe-area-inset-top), 16px);
+    right: 16px;
+    z-index: 100;
+  }
+  #sessions-btn {
+    background: none;
+    border: none;
+    color: var(--dim);
+    font-size: 13px;
+    cursor: pointer;
+    padding: 4px 8px;
+    transition: color 150ms ease;
+  }
+  #sessions-btn:hover {
+    color: var(--fg);
+  }
+  #sessions-dropdown {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    width: 180px;
+    background: #141217;
+    border: 1px solid #2a2533;
+    border-radius: 6px;
+    padding: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  }
+  #sessions-dropdown.hidden {
+    display: none;
+  }
+  #new-session-btn {
+    width: 100%;
+    background: none;
+    border: 1px solid #3d354d;
+    color: var(--fg);
+    padding: 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: border-color 150ms ease;
+  }
+  #new-session-btn:hover {
+    border-color: var(--dim);
+  }
+  .dropdown-divider {
+    height: 1px;
+    background: #2a2533;
+    margin: 8px 0;
+  }
+  #sessions-list-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--dim);
+    margin-bottom: 4px;
+    padding-left: 4px;
+  }
+  #sessions-list {
+    max-height: 160px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  #sessions-list::-webkit-scrollbar {
+    width: 3px;
+  }
+  #sessions-list::-webkit-scrollbar-thumb {
+    background: #2a2533;
+  }
+  .session-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    border-radius: 4px;
+    transition: background 150ms ease;
+  }
+  .session-row:hover {
+    background: #1e1a24;
+  }
+  .session-item {
+    flex: 1;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 4px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    text-align: left;
+    min-width: 0;
+  }
+  .session-item.active {
+    color: var(--user);
+  }
+  .session-delete {
+    background: none;
+    border: none;
+    color: #55505c;
+    cursor: pointer;
+    padding: 6px 8px;
+    font-size: 14px;
+    line-height: 1;
+    transition: color 150ms ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+  }
+  .session-delete:hover {
+    color: var(--error);
+  }
+  .session-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    color: #b8b5bf;
+  }
+  .session-time {
+    font-size: 10px;
+    color: #55505c;
+  }
+  .session-row:hover .session-id {
+    color: var(--fg);
+  }
+  .session-item.active .session-id {
+    color: var(--user);
+  }
 </style>
 </head>
 <body>
+  <div id="session-manager-ui">
+    <button id="sessions-btn" aria-label="Sessions">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display: block;">
+        <line x1="4" y1="12" x2="20" y2="12"></line>
+        <line x1="4" y1="6" x2="20" y2="6"></line>
+        <line x1="4" y1="18" x2="20" y2="18"></line>
+      </svg>
+    </button>
+    <div id="sessions-dropdown" class="hidden">
+      <button id="new-session-btn">new session</button>
+      <div class="dropdown-divider"></div>
+      <div id="sessions-list-title">recent</div>
+      <div id="sessions-list"></div>
+    </div>
+  </div>
   <div id="status">paused</div>
   <div id="orb" class="disabled orb-glyph-css glyph-wave"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
   <div id="transcript"></div>

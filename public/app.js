@@ -55,6 +55,7 @@ function setTranscript(s) { transcriptEl.textContent = s; }
 // every assistant-display state update so chip/text changes are
 // reflected atomically (chip and text live in the same element so
 // "replace chip with text" never leaves a stale chip behind).
+let hasHistory = false;
 let assistantDisplay = initialAssistant;
 function renderAssistant() {
   assistantEl.textContent = "";
@@ -183,6 +184,7 @@ function runAction(action) {
 
 // === Per-session driver state (NOT in reducer) ===============================
 let ws = null;
+let wsPromise = null;
 let ttsSampleRate = 24000;
 let playerCtx = null;
 let playerNode = null;
@@ -194,11 +196,15 @@ let vadBuffer = [];
 // Complete utterance handed to us by the VAD library on onSpeechEnd —
 // preferred over vadBuffer in the natural-end case (no leading-consonant clip).
 let vadEndAudio = null;
-let serverWantsAutoStart = false;
 let prefetchDone = false;
 let started = false;
 let startPromise = null;
 let holdTimer = null;       // promotes a press to HOLD after HOLD_THRESHOLD_MS
+
+// === Session Management State ================================================
+const SESSIONS_KEY = "pi_omni_sessions";
+const ACTIVE_SESSION_KEY = "pi_omni_active_session";
+let currentSessionId = localStorage.getItem(ACTIVE_SESSION_KEY) || "";
 
 // === Prefetch ================================================================
 const PREFETCH = [
@@ -233,23 +239,12 @@ function updateProgress() {
       return;
     }
     startHint.textContent = "push to talk or tap to toggle voice detection";
+    if (hasHistory || started) {
+      startHint.classList.add("hidden");
+    }
     orbEl.classList.remove("disabled");
     prefetchDone = true;
-    maybeAutoStart();
   }
-}
-
-function maybeAutoStart() {
-  if (!serverWantsAutoStart || !prefetchDone || started) return;
-  started = true;
-  start()
-    .then(() => { startHint.classList.add("hidden"); })
-    .catch((e) => {
-      console.warn("[autostart] failed:", e?.message ?? e);
-      started = false;
-      startHint.classList.remove("hidden");
-      startHint.textContent = "push to talk or tap to toggle voice detection";
-    });
 }
 
 async function prefetchOne(i) {
@@ -284,6 +279,7 @@ if (!window.isSecureContext) {
   document.body.classList.add("error");
 } else {
   PREFETCH.forEach((_, i) => prefetchOne(i));
+  openWs().catch((err) => console.warn("Initial WS connect failed:", err));
 }
 
 // === Chime ===================================================================
@@ -575,8 +571,13 @@ async function start() {
   playerNode.port.onmessage = (e) => {
     if (e.data?.type === "drained") dispatch({ type: "WORKLET_DRAINED" });
   };
+  playerNode.port.postMessage({ type: "init", sourceRate: ttsSampleRate });
   arp = new Arpeggiator(playerCtx);
-  await openWs();
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    await openWs();
+  } else if (ws.readyState === WebSocket.CONNECTING) {
+    await wsPromise;
+  }
   await initSession();
 }
 
@@ -686,9 +687,11 @@ async function initSession() {
 }
 
 function openWs(isReconnect = false) {
-  return new Promise((resolve, reject) => {
+  wsPromise = new Promise((resolve, reject) => {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    const sessionId = getActiveSessionId();
+    const wsUrl = `${proto}://${location.host}/ws${sessionId ? `?sessionId=${sessionId}` : ""}`;
+    ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     let settled = false;
     ws.addEventListener("open", () => {
@@ -705,7 +708,9 @@ function openWs(isReconnect = false) {
         reject(new Error("ws connect failed"));
       }
     });
+    const thisWs = ws;
     ws.addEventListener("close", () => {
+      if (ws !== thisWs) return; // intentional teardown (switchSession)
       setBodyState("error", true);
       setBodyState("reconnecting", true);
       dispatch({ type: "WS_CLOSE" });
@@ -714,6 +719,7 @@ function openWs(isReconnect = false) {
     });
     ws.addEventListener("message", onWsMessage);
   });
+  return wsPromise;
 }
 
 function scheduleReconnect() {
@@ -741,7 +747,9 @@ function onWsMessage(ev) {
   // Binary: PCM frame.
   const i16 = new Int16Array(ev.data);
   if (state.workletEmpty) dispatch({ type: "PCM_FIRST" });
-  playerNode.port.postMessage({ type: "pcm", samples: i16 }, [i16.buffer]);
+  if (playerNode) {
+    playerNode.port.postMessage({ type: "pcm", samples: i16 }, [i16.buffer]);
+  }
 }
 
 function handleControl(msg) {
@@ -758,18 +766,41 @@ function handleControl(msg) {
   switch (msg.type) {
     case "hello":
       ttsSampleRate = msg.ttsSampleRate ?? 24000;
-      playerNode.port.postMessage({ type: "init", sourceRate: ttsSampleRate });
-      serverWantsAutoStart = !!msg.autoStart;
+      if (playerNode) {
+        playerNode.port.postMessage({ type: "init", sourceRate: ttsSampleRate });
+      }
       if (typeof msg.orbGlyph === "string" && msg.orbGlyph !== "") {
         orbEl.classList.remove("orb-glyph-css", "glyph-play", "glyph-wave", "glyph-pause", "glyph-square");
         document.querySelector("#orb .glyph").textContent = msg.orbGlyph;
       }
-      maybeAutoStart();
+      if (typeof msg.sessionId === "string" && msg.sessionId !== "") {
+        setActiveSessionId(msg.sessionId);
+        renderSessionsUI();
+      }
+      if (typeof msg.lastUserText === "string" && msg.lastUserText !== "") {
+        setTranscript(msg.lastUserText);
+        hasHistory = true;
+      } else {
+        setTranscript("");
+      }
+      if (typeof msg.lastAssistantText === "string" && msg.lastAssistantText !== "") {
+        updateAssistant({ type: "reset" });
+        updateAssistant({ type: "text", text: msg.lastAssistantText });
+        hasHistory = true;
+      } else {
+        updateAssistant({ type: "reset" });
+      }
+      if (hasHistory) {
+        saveSession(getActiveSessionId());
+        renderSessionsUI();
+        startHint.classList.add("hidden");
+      }
       break;
     case "status":
       if (msg.message === "empty transcription") dispatch({ type: "STATUS_EMPTY" });
       break;
     case "transcript":
+      saveSession(getActiveSessionId());
       setTranscript(msg.text ?? "");
       updateAssistant({ type: "reset" });
       dispatch({ type: "TRANSCRIPT" });
@@ -826,3 +857,174 @@ function wsSendJson(obj) {
   if (!ws || ws.readyState !== 1) return;
   ws.send(JSON.stringify(obj));
 }
+
+// === Session Management (localStorage) =======================================
+
+function getActiveSessionId() { return currentSessionId; }
+
+function setActiveSessionId(id) {
+  currentSessionId = id || "";
+  if (currentSessionId) localStorage.setItem(ACTIVE_SESSION_KEY, currentSessionId);
+  else localStorage.removeItem(ACTIVE_SESSION_KEY);
+}
+
+function switchSession(id) {
+  // cancel any pending reconnect so we don't race
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  // tear down the old socket without triggering auto-reconnect
+  if (ws) {
+    const old = ws;
+    ws = null;
+    try { old.close(); } catch {}
+  }
+  // pause mic/VAD and reset audio setup so the new session starts paused
+  if (micVad) { try { micVad.pause(); } catch {} }
+  started = false;
+  // reset client-side UI state
+  setActiveSessionId(id);
+  hasHistory = false;
+  setTranscript("");
+  updateAssistant({ type: "reset" });
+  startHint.textContent = "push to talk or tap to toggle voice detection";
+  if (prefetchDone) {
+    startHint.classList.remove("hidden");
+  }
+  setBodyState("error", false);
+  setBodyState("reconnecting", false);
+  dispatch({ type: "WS_CLOSE" });
+  renderSessionsUI();
+  // open fresh connection — server assigns a new session when id is empty
+  openWs(false).catch(() => scheduleReconnect());
+}
+
+function getStoredSessions() {
+  try {
+    return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveSession(id) {
+  if (!id) return;
+  let list = getStoredSessions();
+  // Filter out any existing matching ID to move it to the top
+  list = list.filter((s) => s.id !== id);
+  list.unshift({ id, timestamp: Date.now() });
+  // Keep only the last 10 sessions
+  list = list.slice(0, 10);
+  localStorage.setItem(SESSIONS_KEY, JSON.stringify(list));
+}
+
+function deleteSession(id) {
+  if (!id) return;
+  let list = getStoredSessions();
+  list = list.filter((s) => s.id !== id);
+  localStorage.setItem(SESSIONS_KEY, JSON.stringify(list));
+}
+
+function formatRelativeTime(timestamp) {
+  const diff = Date.now() - timestamp;
+  const secs = Math.floor(diff / 1000);
+  if (secs < 60) return "just now";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function renderSessionsUI() {
+  const dropdown = document.getElementById("sessions-dropdown");
+  const listEl = document.getElementById("sessions-list");
+  if (!listEl) return;
+
+  const currentId = getActiveSessionId();
+  const list = getStoredSessions();
+
+  listEl.innerHTML = "";
+  if (list.length === 0) {
+    const empty = document.createElement("div");
+    empty.style.fontSize = "12px";
+    empty.style.color = "var(--dim)";
+    empty.style.padding = "8px 4px";
+    empty.textContent = "no recent sessions";
+    listEl.appendChild(empty);
+    return;
+  }
+
+  for (const s of list) {
+    const row = document.createElement("div");
+    row.className = "session-row";
+
+    const btn = document.createElement("button");
+    btn.className = "session-item";
+    if (s.id === currentId) {
+      btn.classList.add("active");
+    }
+
+    const idSpan = document.createElement("span");
+    idSpan.className = "session-id";
+    idSpan.textContent = s.id.substring(0, 8); // show truncated session ID
+
+    const timeSpan = document.createElement("span");
+    timeSpan.className = "session-time";
+    timeSpan.textContent = formatRelativeTime(s.timestamp);
+
+    btn.appendChild(idSpan);
+    btn.appendChild(timeSpan);
+
+    btn.addEventListener("click", () => {
+      switchSession(s.id);
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "session-delete";
+    delBtn.setAttribute("aria-label", "Delete Session");
+    delBtn.innerHTML = "&times;";
+    delBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isActive = (s.id === currentId);
+      deleteSession(s.id);
+      if (isActive) {
+        switchSession("");
+      } else {
+        renderSessionsUI();
+      }
+    });
+
+    row.appendChild(btn);
+    row.appendChild(delBtn);
+    listEl.appendChild(row);
+  }
+}
+
+// Wire up UI event listeners
+const sessionsBtn = document.getElementById("sessions-btn");
+const sessionsDropdown = document.getElementById("sessions-dropdown");
+const newSessionBtn = document.getElementById("new-session-btn");
+
+if (sessionsBtn && sessionsDropdown && newSessionBtn) {
+  sessionsBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    sessionsDropdown.classList.toggle("hidden");
+    if (!sessionsDropdown.classList.contains("hidden")) {
+      renderSessionsUI();
+    }
+  });
+
+  newSessionBtn.addEventListener("click", () => {
+    switchSession("");
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!sessionsDropdown.classList.contains("hidden") && !sessionsDropdown.contains(e.target) && e.target !== sessionsBtn) {
+      sessionsDropdown.classList.add("hidden");
+    }
+  });
+
+  // Render initially
+  renderSessionsUI();
+}
+

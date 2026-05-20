@@ -3,6 +3,7 @@
 ## backlog
 
 ```
+
 [ ] PTT during live mode should barge in and return to paused after
 [ ] rename paused to something better, like idle?
 [ ] animate waveform when recording or something?
@@ -10,12 +11,13 @@
 [ ] whisper in the browser (whisper.cpp WASM / transformers.js) — keep only LLM on server
 [ ] TTS in the browser (Kokoro / Piper WASM) — eliminate audio round-trip
 [ ] smarter sentence chunking (abbreviation-aware: "e.g.", "i.e.", "Dr.", ...)
-[ ] discard LLM tokens after barge-in instead of generating-then-dropping
-```
-
 ## done
 
 ```
+[x] simplify autostart logic and fix onboarding hint visibility on new session
+[x] expand test coverage for session preservation, deletion, and connection state changes
+[x] support WebSocket disconnect/reconnect session preservation and new session action
+[x] make status text slightly larger and match glow color for each phase
 [x] move "loading VAD" message to start-hint element
 [x] fix PWA install button in Firefox Android (missing 192/512 icons)
 [x] convert to PWA with a premium icon

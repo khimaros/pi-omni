@@ -62,6 +62,8 @@ PI_VOICE_LLM_MODEL=qwen3-32b pi-omni-web
 
 then open <http://127.0.0.1:4962>.
 
+Once loaded, the Web UI automatically tracks active sessions. You can use the premium glassmorphic **sessions** menu in the top-right corner to view a list of recent sessions, switch between them, or start a new session instantly. Reconnecting after a WebSocket disconnect or reloading the page automatically resumes the active session based on the URL hash.
+
 ### pwa installation
 
 the web UI is a Progressive Web App (PWA). you can "install" it to your home screen or desktop for a native-like experience:

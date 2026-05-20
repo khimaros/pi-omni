@@ -1,5 +1,6 @@
 import type { WebSocket } from "ws";
 import type OpenAI from "openai";
+import { randomUUID } from "node:crypto";
 import { transcribe } from "../audio/stt.js";
 import { TtsPlayer, type TtsPhase, type TtsPhaseInfo } from "../audio/tts.js";
 import { sanitizeForSpeech } from "../audio/sanitize.js";
@@ -40,6 +41,11 @@ export type SessionDeps = {
   onDeactivate: (s: WebSession) => void;
   // Optional logger; if omitted, swallow.
   logger?: (m: string, l?: "info" | "warning" | "error") => void;
+  // Optional session history to populate on first load or reconnect
+  history?: {
+    lastUserText?: string;
+    lastAssistantText?: string;
+  };
 };
 
 export class WebSession {
@@ -52,10 +58,12 @@ export class WebSession {
   private sawDeltasThisTurn = false;
   private turn = new TurnLifecycle();
   private disposed = false;
+  public readonly sessionId: string;
 
-  constructor(ws: WebSocket, deps: SessionDeps) {
+  constructor(ws: WebSocket, deps: SessionDeps, sessionId?: string) {
     this.ws = ws;
     this.deps = deps;
+    this.sessionId = sessionId || randomUUID();
     // TtsPlayer with a no-op speaker; we drain the SSE stream for its PCM
     // (via onPcm) and forward to the WS instead of playing locally.
     this.tts = new TtsPlayer({
@@ -81,6 +89,46 @@ export class WebSession {
       onPcm: (pcm) => this.sendBinary(pcm),
     });
 
+    this.bindSocket(ws);
+
+    this.sendJson({
+      type: "hello",
+      captureRate: 16000,
+      ttsSampleRate: deps.cfg.ttsSampleRate,
+      autoStart: deps.cfg.webAutoStart,
+      orbGlyph: deps.cfg.orbGlyph,
+      sessionId: this.sessionId,
+      lastUserText: deps.history?.lastUserText,
+      lastAssistantText: deps.history?.lastAssistantText,
+    });
+    deps.onActivate(this);
+  }
+
+  public get socket(): WebSocket {
+    return this.ws;
+  }
+
+  public attach(ws: WebSocket): void {
+    try {
+      this.ws.removeAllListeners();
+      this.ws.close();
+    } catch {}
+    this.ws = ws;
+    this.bindSocket(ws);
+    this.sendJson({
+      type: "hello",
+      captureRate: 16000,
+      ttsSampleRate: this.deps.cfg.ttsSampleRate,
+      autoStart: this.deps.cfg.webAutoStart,
+      orbGlyph: this.deps.cfg.orbGlyph,
+      sessionId: this.sessionId,
+      lastUserText: this.deps.history?.lastUserText,
+      lastAssistantText: this.deps.history?.lastAssistantText,
+    });
+    this.deps.onActivate(this);
+  }
+
+  private bindSocket(ws: WebSocket): void {
     ws.on("message", (data, isBinary) => {
       try {
         if (isBinary) this.onAudio(data as Buffer);
@@ -90,15 +138,6 @@ export class WebSession {
       }
     });
     ws.on("error", (e) => this.log(`session: ws error: ${e.message}`, "warning"));
-
-    this.sendJson({
-      type: "hello",
-      captureRate: 16000,
-      ttsSampleRate: deps.cfg.ttsSampleRate,
-      autoStart: deps.cfg.webAutoStart,
-      orbGlyph: deps.cfg.orbGlyph,
-    });
-    deps.onActivate(this);
   }
 
   // Forwarded from index.ts event handlers when this session is active.

@@ -12,6 +12,8 @@ The core pi extension that handles commands and shortcuts within the pi TUI.
 ### Web Server (src/server/)
 A Node.js HTTP and WebSocket server that serves the browser-based UI and handles real-time communication between the browser and the pi session.
 
+To prevent memory leaks, the server immediately disposes of `WebSession` and agent runtime resources on WebSocket disconnect. When the client reconnects (e.g. following a reload or network recovery) using the same session ID via URL query parameters, the server re-opens the session's `.jsonl` transcript file from disk, reconstructing the agent session state seamlessly. If a new connection occurs before the old socket's close event is fully processed, the server hot-swaps the socket to avoid a reload.
+
 ### Audio Pipeline (src/audio/)
 Handles microphone input, Voice Activity Detection (VAD), Acoustic Echo Cancellation (AEC), Speech-to-Text (STT), and Text-to-Speech (TTS).
 

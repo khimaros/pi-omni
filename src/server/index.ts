@@ -64,6 +64,7 @@ export type WebServerOptions = {
   makeSession: (
     ws: WebSocket,
     logger: (m: string, l?: string) => void,
+    requestedSessionId?: string,
   ) => WebSession | Promise<WebSession>;
   logger: (m: string, l?: "info" | "warning" | "error") => void;
 };
@@ -76,6 +77,8 @@ export type RunningServer = {
 };
 
 export async function startWebServer(opts: WebServerOptions): Promise<RunningServer> {
+  const sessions = new Map<string, WebSession>();
+
   // Surface where each vendor dep is being served from, and warn loudly if
   // the dir is missing — the silent-fail mode is a disabled start button.
   for (const v of VENDOR_MAP) {
@@ -103,29 +106,58 @@ export async function startWebServer(opts: WebServerOptions): Promise<RunningSer
     if (url.pathname !== "/ws") return socket.destroy();
     wss.handleUpgrade(req, socket, head, (ws) => {
       void (async () => {
+        const sessionId = url.searchParams.get("sessionId") || undefined;
         let session: WebSession;
-        try {
-          session = await opts.makeSession(ws, (m, l) =>
-            opts.logger(m, (l as "info" | "warning" | "error" | undefined) ?? "info"),
-          );
-        } catch (e) {
-          opts.logger(`makeSession failed: ${(e as Error).message}`, "error");
+
+        if (sessionId && sessions.has(sessionId)) {
+          session = sessions.get(sessionId)!;
           try {
-            ws.close();
-          } catch {}
-          return;
-        }
-        // The socket may have closed during async bootstrap; dispose now if so.
-        if (ws.readyState === ws.CLOSED || ws.readyState === ws.CLOSING) {
+            session.attach(ws);
+            opts.logger(`ws: re-attached to existing session ${sessionId}`, "info");
+          } catch (e) {
+            opts.logger(`ws: failed to re-attach to session ${sessionId}: ${(e as Error).message}`, "error");
+            try {
+              ws.close();
+            } catch {}
+            return;
+          }
+        } else {
           try {
-            session.dispose();
-          } catch {}
-          return;
+            session = await opts.makeSession(
+              ws,
+              (m, l) => opts.logger(m, (l as "info" | "warning" | "error" | undefined) ?? "info"),
+              sessionId,
+            );
+          } catch (e) {
+            opts.logger(`makeSession failed: ${(e as Error).message}`, "error");
+            try {
+              ws.close();
+            } catch {}
+            return;
+          }
+
+          // The socket may have closed during async bootstrap; dispose now if so.
+          if (ws.readyState === ws.CLOSED || ws.readyState === ws.CLOSING) {
+            try {
+              session.dispose();
+            } catch {}
+            return;
+          }
+
+          sessions.set(session.sessionId, session);
+          opts.logger(`ws: created new session ${session.sessionId}`, "info");
         }
+
         ws.on("close", () => {
+          if (session.socket !== ws) {
+            // Old socket that closed after re-attach. Ignore it.
+            return;
+          }
+          opts.logger(`ws: connection closed for session ${session.sessionId}, disposing immediately`, "info");
           try {
             session.dispose();
           } catch {}
+          sessions.delete(session.sessionId);
         });
       })();
     });
@@ -143,6 +175,12 @@ export async function startWebServer(opts: WebServerOptions): Promise<RunningSer
     url,
     close: () =>
       new Promise<void>((res) => {
+        for (const [sid, session] of sessions) {
+          try {
+            session.dispose();
+          } catch {}
+        }
+        sessions.clear();
         for (const c of wss.clients) c.close();
         wss.close(() => http.close(() => res()));
       }),

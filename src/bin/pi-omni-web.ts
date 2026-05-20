@@ -6,7 +6,8 @@
 // in the loop. The OpenAI-compatible endpoint from cfg is still used for STT
 // and TTS only.
 
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { readdirSync } from "node:fs";
 import OpenAI from "openai";
 import {
   createAgentSessionFromServices,
@@ -95,9 +96,36 @@ async function main(): Promise<void> {
   // Trade-off: extensions re-init per connection — slower first-utterance
   // latency, but the only correct behavior when multiple users / tabs hit
   // the same server.
+  function findSessionFile(sessionId: string, dir: string): string | undefined {
+    try {
+      const files = readdirSync(dir);
+      const suffix = `_${sessionId}.jsonl`;
+      const found = files.find((f) => f.endsWith(suffix));
+      if (found) {
+        return join(dir, found);
+      }
+    } catch {}
+    return undefined;
+  }
+
   const createPiSessionForConnection = async (
     connLog: (m: string, l?: "info" | "warning" | "error") => void,
+    requestedSessionId?: string,
   ) => {
+    const defaultMgr = SessionManager.create(cwd, sessionDir);
+    const resolvedSessionDir = defaultMgr.getSessionDir();
+
+    let activeMgr = defaultMgr;
+    if (requestedSessionId) {
+      const file = findSessionFile(requestedSessionId, resolvedSessionDir);
+      if (file) {
+        connLog(`resuming existing pi session: ${requestedSessionId}`);
+        activeMgr = SessionManager.open(file, sessionDir);
+      } else {
+        connLog(`requested session ${requestedSessionId} not found, starting new`);
+      }
+    }
+
     const runtime = await createAgentSessionRuntime(
       async ({ cwd, sessionManager, sessionStartEvent }: any) => {
         const services = await createAgentSessionServices({ cwd, agentDir });
@@ -116,7 +144,7 @@ async function main(): Promise<void> {
       {
         cwd,
         agentDir,
-        sessionManager: SessionManager.create(cwd, sessionDir),
+        sessionManager: activeMgr,
       },
     );
     const session = runtime.session;
@@ -175,7 +203,7 @@ async function main(): Promise<void> {
         connLog(`diag(${type}): ${d?.message ?? JSON.stringify(d)} ${d?.path ?? ""}`, lvl);
       }
     }
-    return { runtime, session };
+    return { runtime, session, sessionManager: activeMgr };
   };
 
   // Transcript logging — every prompt, tool call, and assistant reply is
@@ -244,8 +272,8 @@ async function main(): Promise<void> {
     host,
     port,
     logger: log,
-    makeSession: async (ws, logger) => {
-      const { runtime, session } = await createPiSessionForConnection(logger);
+    makeSession: async (ws, logger, requestedSessionId) => {
+      const { runtime, session, sessionManager } = await createPiSessionForConnection(logger, requestedSessionId);
       liveRuntimes.add(runtime);
 
       let webSession: WebSession | undefined;
@@ -342,18 +370,41 @@ async function main(): Promise<void> {
         }
       };
 
-      webSession = new WebSession(ws, {
-        cfg,
-        client: sttTtsClient,
-        sendUserMessage: (text) => {
-          void sendUserMessage(text);
+      let lastUserText: string | undefined;
+      let lastAssistantText: string | undefined;
+      try {
+        const context = sessionManager.buildSessionContext();
+        const messages = context.messages ?? [];
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i];
+          if (m.role === "user" && !lastUserText) {
+            lastUserText = stringifyContent(m.content);
+          } else if (m.role === "assistant" && !lastAssistantText) {
+            lastAssistantText = splitAssistantContent(m.content).answer;
+          }
+          if (lastUserText && lastAssistantText) break;
+        }
+      } catch (e) {
+        logger(`failed to extract session history: ${(e as Error).message}`, "warning");
+      }
+
+      webSession = new WebSession(
+        ws,
+        {
+          cfg,
+          client: sttTtsClient,
+          sendUserMessage: (text) => {
+            void sendUserMessage(text);
+          },
+          // onActivate/onDeactivate are no-ops now that each connection owns
+          // its own pi session — there's no shared active-session to track.
+          onActivate: () => {},
+          onDeactivate: () => {},
+          logger,
+          history: { lastUserText, lastAssistantText },
         },
-        // onActivate/onDeactivate are no-ops now that each connection owns
-        // its own pi session — there's no shared active-session to track.
-        onActivate: () => {},
-        onDeactivate: () => {},
-        logger,
-      });
+        sessionManager.getSessionId(),
+      );
 
       // Wrap dispose so closing the WS also tears down this connection's
       // pi runtime. Without this, every refresh would leak a session.
