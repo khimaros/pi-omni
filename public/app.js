@@ -247,6 +247,7 @@ function maybeAutoStart() {
     .catch((e) => {
       console.warn("[autostart] failed:", e?.message ?? e);
       started = false;
+      startHint.classList.remove("hidden");
       startHint.textContent = "push to talk or tap to toggle voice detection";
     });
 }
@@ -523,8 +524,9 @@ orbDot.addEventListener("pointerdown", (e) => {
   if (!started) {
     ensurePlayerCtx();
     started = true;
-    startHint.classList.add("hidden");
-    startPromise = start().catch((err) => {
+    startPromise = start().then(() => {
+      startHint.classList.add("hidden");
+    }).catch((err) => {
       console.error("[start] failed:", err);
       setStatus(`error: ${err.message ?? err}`);
       setBodyState("error", true);
@@ -583,7 +585,7 @@ async function initMic() {
   if (!window.vad || !window.vad.MicVAD) {
     throw new Error("vad-web library not loaded");
   }
-  setStatus("loading VAD model…");
+  startHint.textContent = "loading VAD model…";
   micVad = await window.vad.MicVAD.new({
     audioContext: playerCtx,
     model: "v5",

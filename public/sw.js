@@ -9,6 +9,8 @@ const ASSETS = [
   '/ptt.js',
   '/worklet.js',
   '/icon.png',
+  '/icon-192.png',
+  '/icon-512.png',
   '/manifest.json'
 ];
 

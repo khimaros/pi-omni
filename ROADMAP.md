@@ -16,6 +16,8 @@
 ## done
 
 ```
+[x] move "loading VAD" message to start-hint element
+[x] fix PWA install button in Firefox Android (missing 192/512 icons)
 [x] convert to PWA with a premium icon
 [x] replace energy VAD with Silero-WASM for more robust speech detection
 [x] move AEC3 into the browser (wasm-pack --target web) for the web UI path
