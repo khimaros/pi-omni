@@ -222,12 +222,12 @@ const HANDLERS = {
   },
 
   HOLD(state) {
-    if (state.sessionMode === "ptt") return { state, actions: [] };
-    // Whether coming from pause or live, we end up in PTT. From live we
-    // must silently pause the VAD mic first; the driver bundles that
-    // into OPEN_PTT. Any in-flight server turn (thinking / synthesizing
-    // / speaking) gets cancelled — symmetric with VAD barge-in.
-    const fromLive = state.sessionMode === "live";
+    // HOLD is only meaningful from a fully paused state. Holding while
+    // already in PTT is a no-op (already capturing); holding from live
+    // is intentionally rejected — switching capture modes mid-session
+    // is confusing UX, and the user can always tap to pause first.
+    if (state.sessionMode !== "pause") return { state, actions: [] };
+    // Cancel any in-flight server turn — symmetric with VAD barge-in.
     const { state: cancelled, actions: cancelActions } = cancelInFlight(state);
     const next = {
       ...cancelled,
@@ -238,7 +238,7 @@ const HANDLERS = {
     };
     return withPhase(next, "recording", [
       ...cancelActions,
-      { type: "OPEN_PTT", fromLive },
+      { type: "OPEN_PTT" },
     ]);
   },
 

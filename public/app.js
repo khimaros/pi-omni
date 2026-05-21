@@ -168,7 +168,7 @@ function applyState(prev, next) {
 function runAction(action) {
   switch (action.type) {
     case "OPEN_LIVE":     openLive(); break;
-    case "OPEN_PTT":      openPtt(action.fromLive); break;
+    case "OPEN_PTT":      openPtt(); break;
     case "CLOSE_LIVE":    closeLive(); break;
     case "CLOSE_PTT":     closePtt(); break;
     case "PLAY_CHIME":    playChimeAndPause(action.reverse); break;
@@ -226,23 +226,22 @@ function updateProgress() {
     else allKnown = false;
   }
   if (total > 0) {
-    const mb = (n) => (n / (1024 * 1024)).toFixed(1);
     const pct = Math.min(100, Math.round((loaded / total) * 100));
-    startHint.textContent = allKnown
-      ? `downloading voice model… ${pct}% (${mb(loaded)} / ${mb(total)} MB)`
-      : `downloading voice model… ${mb(loaded)} MB`;
+    setStatus(allKnown ? `downloading ${pct}%` : "downloading");
   }
   if (prefetchState.every((s) => s.done)) {
     const failures = prefetchState
       .map((s, i) => (s.failed ? PREFETCH[i] : null))
       .filter(Boolean);
     if (failures.length > 0) {
-      startHint.textContent =
-        `failed to load ${failures.map((f) => f.label).join(", ")} — ` +
-        `check server logs (vendor asset 404s)`;
+      setStatus(`error: failed to load ${failures.map((f) => f.label).join(", ")}`);
       document.body.classList.add("error");
       return;
     }
+    // Hand the status line back to the reducer — it'll be repainted to
+    // the current phase on the next phase change. Set the resting text
+    // explicitly here since no phase change fires at prefetch completion.
+    setStatus(state.phase);
     startHint.textContent = "push to talk or tap to toggle voice detection";
     if (hasHistory || started) {
       startHint.classList.add("hidden");
@@ -294,7 +293,14 @@ async function playChime(reverse) {
   // playerCtx in "suspended" or "interrupted"; scheduling oscillators
   // in either state silently no-ops. ensureAudioRunning resumes and
   // gives the OS audio session a moment to re-route before we schedule.
+  const preState = playerCtx.state;
   await ensureAudioRunning(playerCtx, AUDIO_SESSION_RESUME_MS);
+  const postState = playerCtx.state;
+  logEvent({
+    t: performance.now() - logT0,
+    event: `chime-${reverse ? "close" : "open"}`,
+    note: `state:${preState}→${postState}`,
+  });
   // Blend into the arp if it's running.
   const blend = arp?.active === true;
   const dest = blend ? arp.master : playerCtx.destination;
@@ -304,29 +310,12 @@ async function playChime(reverse) {
   const notes = reverse ? [1046.5, 783.99] : [783.99, 1046.5];
   const noteDur = 0.16;
   const stagger = 0.09;
-  // Audio session warmup. iOS (and some Android browsers) put the audio
-  // session into a low-power "idle" state when nothing has played for a
-  // few seconds. The next sound's first ~50-80ms is then fade-in ramped
-  // by the OS, swallowing the chime's onset. Schedule an inaudible
-  // sub-audible tone for `warmupSec` ahead of the chime so the session
-  // is fully active by the time the chime's first note begins. Skipped
-  // when blending into the arp (audio session is already warm).
-  const warmupSec = blend ? 0 : 0.10;
-  if (warmupSec > 0) {
-    const warmStart = playerCtx.currentTime;
-    const warmOsc = playerCtx.createOscillator();
-    warmOsc.frequency.value = 60;
-    const warmGain = playerCtx.createGain();
-    warmGain.gain.value = 0.0001;
-    warmOsc.connect(warmGain);
-    warmGain.connect(dest);
-    warmOsc.start(warmStart);
-    warmOsc.stop(warmStart + warmupSec + 0.02);
-  }
   // leadSec sits well above the audio thread's quantum so the t0 ramp
-  // never lands in the past, AND past the warmup so the OS audio
-  // session has finished its idle-to-active ramp before the chime hits.
-  const leadSec = warmupSec + 0.040;
+  // never lands in the past — if it did, the 0→peak attack would
+  // collapse and the note would start at full gain (or skip entirely).
+  // The audio engine itself is kept awake by the keepalive oscillator
+  // wired up at start(), so we don't need a per-chime warmup anymore.
+  const leadSec = 0.040;
   const now = playerCtx.currentTime + leadSec;
   for (let i = 0; i < notes.length; i++) {
     const t0 = now + i * stagger;
@@ -450,6 +439,9 @@ async function openMicLifecycle({ sessionMode, prepare, acquire, onReady }) {
     catch { dispatch({ type: "OPEN_ERROR", message: "start failed" }); return; }
   }
   try {
+    // Resume playerCtx before acquire — MicVAD/PTT setup expects a
+    // running context, and we may be coming from a suspended idle state.
+    await ensureAudioRunning(playerCtx, AUDIO_SESSION_RESUME_MS);
     if (prepare) await prepare();
     if (state.sessionMode !== sessionMode) return;
     await acquire();
@@ -458,6 +450,7 @@ async function openMicLifecycle({ sessionMode, prepare, acquire, onReady }) {
     if (state.sessionMode !== sessionMode) return;
     onReady?.();
     dispatch({ type: "OPEN_DONE", kind: sessionMode });
+    maybeSuspendPlayer();
   } catch (e) {
     console.error(`[${sessionMode}] mic init failed:`, e);
     dispatch({ type: "OPEN_ERROR", message: `mic: ${e.message ?? e}` });
@@ -468,25 +461,33 @@ async function closeMicLifecycle({ release, getHadAudio = () => true }) {
   await playChimeAndPause(true);
   await release();
   dispatch({ type: "CLOSE_DONE", hadAudio: getHadAudio() });
+  maybeSuspendPlayer();
+}
+
+// Suspend playerCtx when no audio is in flight, so mobile browsers
+// don't park the underlying audio stream behind our back (which drops
+// the first ~100ms of the next chime). We re-resume in
+// openMicLifecycle and inside playChime's ensureAudioRunning.
+//
+// Skip when:
+//   - sessionMode is "live": MicVAD shares playerCtx for inference and
+//     stops processing if we suspend.
+//   - phase is anything other than "paused" or "recording": means arp
+//     or TTS is currently scheduled on playerCtx (mid-turn).
+function maybeSuspendPlayer() {
+  if (!playerCtx || playerCtx.state !== "running") return;
+  if (state.sessionMode === "live") return;
+  if (state.phase !== "paused" && state.phase !== "recording") return;
+  try { playerCtx.suspend(); } catch {}
 }
 
 async function openLive() {
   return openMicLifecycle({ sessionMode: "live", acquire: ensureLiveMic });
 }
 
-async function openPtt(fromLive) {
+async function openPtt() {
   return openMicLifecycle({
     sessionMode: "ptt",
-    // Coming from live mode, silently pause the VAD mic before opening
-    // PTT — no chime, the PTT open chime will play in a moment.
-    prepare: async () => {
-      if (fromLive && micVad) {
-        try { await micVad.pause(); } catch {}
-        vadBuffer = [];
-        vadEndAudio = null;
-        await new Promise((r) => setTimeout(r, MIC_OFF_SETTLE_MS));
-      }
-    },
     acquire: async () => {
       await ensurePttMic();
       if (pttCtx?.state === "suspended") { try { await pttCtx.resume(); } catch {} }
@@ -514,6 +515,7 @@ async function closePtt() {
 async function releaseMicAction() {
   await releaseLiveMic();
   dispatch({ type: "CLOSE_DONE", hadAudio: true });
+  maybeSuspendPlayer();
 }
 
 async function releaseLiveMic() {
@@ -610,6 +612,16 @@ orbDot.addEventListener("pointercancel", onOrbUp);
 function ensurePlayerCtx() {
   if (playerCtx) return;
   playerCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+  // Diagnostic: surface state transitions so we can tell whether mobile
+  // Firefox is moving the context to "interrupted" or "suspended" while
+  // we sit idle in listening. Logged to #eventlog (visible on device).
+  playerCtx.addEventListener("statechange", () => {
+    logEvent({
+      t: performance.now() - logT0,
+      event: "playerCtx-state",
+      note: playerCtx.state,
+    });
+  });
   try { playerCtx.resume(); } catch {}
 }
 
@@ -642,7 +654,7 @@ async function initMic() {
   if (!window.vad || !window.vad.MicVAD) {
     throw new Error("vad-web library not loaded");
   }
-  startHint.textContent = "loading VAD model…";
+  setStatus("initializing");
   micVad = await window.vad.MicVAD.new({
     audioContext: playerCtx,
     model: "v5",
@@ -702,17 +714,38 @@ const ptt = createPtt({
 
 async function ensurePttMic() {
   if (pttCtx) return;
-  pttCtx = new (window.AudioContext || window.webkitAudioContext)({
+  // Race-safety: a quick RELEASE during the getUserMedia await can fire
+  // releasePttMic() concurrently, nulling pttCtx before our stream
+  // resolves. Keep a local handle and check it's still ours after each
+  // await — if not, clean up the mic we just acquired and bail.
+  const myCtx = new (window.AudioContext || window.webkitAudioContext)({
     sampleRate: TARGET_CAPTURE_RATE,
   });
-  pttStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      channelCount: 1,
-    },
-  });
+  pttCtx = myCtx;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
+  } catch (e) {
+    if (pttCtx === myCtx) {
+      try { myCtx.close(); } catch {}
+      pttCtx = null;
+    }
+    throw e;
+  }
+  if (pttCtx !== myCtx) {
+    // Released during getUserMedia — drop the freshly-acquired mic.
+    try { stream.getTracks().forEach((t) => t.stop()); } catch {}
+    try { myCtx.close(); } catch {}
+    return;
+  }
+  pttStream = stream;
   pttSource = pttCtx.createMediaStreamSource(pttStream);
   pttProcessor = pttCtx.createScriptProcessor(2048, 1, 1);
   pttProcessor.onaudioprocess = (e) => {

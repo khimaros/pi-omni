@@ -151,18 +151,14 @@ test("HOLD from pause enters PTT immediately (phase=recording, overlay hides)", 
   assert.equal(state.phase, "recording");
   assert.equal(state.pttHeld, true);
   assert.deepEqual(actionTypes(actions), ["OPEN_PTT"]);
-  // OPEN_PTT carries fromLive=false from pause.
-  const openPtt = actions.find((a) => a.type === "OPEN_PTT");
-  assert.equal(openPtt.fromLive, false);
 });
 
-test("HOLD from live transitions to PTT with fromLive=true", () => {
+test("HOLD from live is a no-op (mode switch mid-session is rejected)", () => {
   const live = run([{ type: "TAP" }, { type: "OPEN_DONE", kind: "live" }]).state;
   const { state, actions } = reduce(live, { type: "HOLD" });
-  assert.equal(state.sessionMode, "ptt");
-  assert.equal(state.phase, "recording");
-  const openPtt = actions.find((a) => a.type === "OPEN_PTT");
-  assert.equal(openPtt.fromLive, true);
+  assert.equal(state.sessionMode, "live");
+  assert.equal(state.phase, "listening");
+  assert.deepEqual(actions, []);
 });
 
 test("OPEN_DONE(ptt) sends audio_start", () => {
@@ -302,11 +298,10 @@ test("VAD_SPEECH_START during TTS playback cancels and goes to recording", () =>
   assert.ok(audioStart);
 });
 
-test("HOLD during TTS playback cancels and goes to recording (PTT barge-in)", () => {
-  // Mirrors VAD_SPEECH_START barge-in: pressing PTT mid-speech must
-  // cancel server TTS, reset the local worklet, and clear speaking
-  // flags. Without this, held audio keeps playing over the user's
-  // utterance and the server keeps generating the turn we interrupted.
+test("TAP+HOLD during TTS playback cancels and goes to recording (PTT barge-in)", () => {
+  // Direct HOLD from live is rejected; users barge in by tapping pause
+  // mid-turn (deferred mic release) and then holding. The HOLD from
+  // pause still cancels in-flight TTS via cancelInFlight.
   const speaking = run([
     { type: "TAP" },
     { type: "OPEN_DONE", kind: "live" },
@@ -315,8 +310,10 @@ test("HOLD during TTS playback cancels and goes to recording (PTT barge-in)", ()
     { type: "TRANSCRIPT" },
     { type: "TTS_START" },
     { type: "PCM_FIRST" },
+    { type: "TAP" }, // mid-turn pause: sessionMode=pause, phase preserved
   ]).state;
-  assert.equal(speaking.phase, "speaking");
+  assert.equal(speaking.sessionMode, "pause");
+  assert.equal(speaking.phase, "speaking"); // mid-turn pause doesn't change phase
 
   const { state, actions } = reduce(speaking, { type: "HOLD" });
   assert.equal(state.sessionMode, "ptt");
@@ -325,20 +322,21 @@ test("HOLD during TTS playback cancels and goes to recording (PTT barge-in)", ()
   assert.equal(state.workletEmpty, true);
   assert.ok(hasAction(actions, "WORKLET_RESET"));
   const cancel = actions.find((a) => a.type === "WS_SEND" && a.msg?.type === "cancel");
-  assert.ok(cancel, "HOLD during TTS must send a cancel to the server");
+  assert.ok(cancel, "HOLD mid-turn must send a cancel to the server");
 });
 
-test("HOLD during thinking opens PTT without cancelling — server aborts LLM on new prompt", () => {
-  // No TTS is playing yet, so there's nothing local to cancel. The
-  // LLM stays alive; the server-side "new prompt mid-turn" path will
-  // abort it once our PTT utterance lands. thinking flag is preserved.
+test("TAP+HOLD during thinking opens PTT without cancelling — server aborts LLM on new prompt", () => {
+  // No TTS playing yet — cancelInFlight is a no-op. The LLM stays
+  // alive; server-side abort happens when the PTT utterance lands.
   const thinking = run([
     { type: "TAP" },
     { type: "OPEN_DONE", kind: "live" },
     { type: "VAD_SPEECH_START" },
     { type: "VAD_SPEECH_END" },
     { type: "TRANSCRIPT" },
+    { type: "TAP" }, // mid-turn pause
   ]).state;
+  assert.equal(thinking.sessionMode, "pause");
   assert.equal(thinking.thinking, true);
 
   const { state, actions } = reduce(thinking, { type: "HOLD" });
@@ -349,9 +347,7 @@ test("HOLD during thinking opens PTT without cancelling — server aborts LLM on
   assert.ok(!actions.some((a) => a.type === "WS_SEND" && a.msg?.type === "cancel"));
 });
 
-test("HOLD during synthesizing cancels TTS but leaves thinking alive", () => {
-  // synthesizing has speaking=true (TTS_START set it). Cancel TTS so
-  // any first-chunk audio is suppressed, but don't pre-empt the LLM.
+test("TAP+HOLD during synthesizing cancels TTS but leaves thinking alive", () => {
   const synth = run([
     { type: "TAP" },
     { type: "OPEN_DONE", kind: "live" },
@@ -359,8 +355,9 @@ test("HOLD during synthesizing cancels TTS but leaves thinking alive", () => {
     { type: "VAD_SPEECH_END" },
     { type: "TRANSCRIPT" },
     { type: "TTS_START" },
+    { type: "TAP" }, // mid-turn pause
   ]).state;
-  assert.equal(synth.phase, "synthesizing");
+  assert.equal(synth.sessionMode, "pause");
   assert.equal(synth.speaking, true);
   assert.equal(synth.thinking, true);
 
@@ -387,7 +384,7 @@ test("VAD_SPEECH_START during thinking does not cancel — server handles it on 
   assert.ok(!actions.some((a) => a.type === "WS_SEND" && a.msg?.type === "cancel"));
 });
 
-test("barge-in via HOLD stops the arpeggio (was thinking/synthesizing)", () => {
+test("barge-in via TAP+HOLD stops the arpeggio (was thinking/synthesizing)", () => {
   // thinking is in ARP_PHASES — entering recording must emit ARP_STOP.
   const thinking = run([
     { type: "TAP" },
@@ -395,6 +392,7 @@ test("barge-in via HOLD stops the arpeggio (was thinking/synthesizing)", () => {
     { type: "VAD_SPEECH_START" },
     { type: "VAD_SPEECH_END" },
     { type: "TRANSCRIPT" },
+    { type: "TAP" },
   ]).state;
   assert.ok(ARP_PHASES.has(thinking.phase));
   const { actions } = reduce(thinking, { type: "HOLD" });
@@ -407,6 +405,7 @@ test("barge-in via HOLD stops the arpeggio (was thinking/synthesizing)", () => {
     { type: "VAD_SPEECH_END" },
     { type: "TRANSCRIPT" },
     { type: "TTS_START" },
+    { type: "TAP" },
   ]).state;
   assert.equal(synth.phase, "synthesizing");
   const { actions: a2 } = reduce(synth, { type: "HOLD" });
@@ -445,14 +444,15 @@ test("stale TRANSCRIPT during recording (post-barge via VAD) does not clobber ph
 });
 
 test("stale TRANSCRIPT during PTT recording does not clobber phase", () => {
-  // Same race via PTT: HOLD during transcribing → recording, then the
-  // old STT lands.
+  // Same race via PTT: TAP-pause then HOLD during transcribing →
+  // recording, then the old STT lands.
   const recording = run([
     { type: "TAP" },
     { type: "OPEN_DONE", kind: "live" },
     { type: "VAD_SPEECH_START" },
     { type: "VAD_SPEECH_END" }, // phase=transcribing
-    { type: "HOLD" }, // phase=recording, sessionMode=ptt
+    { type: "TAP" },            // mid-turn pause: sessionMode=pause
+    { type: "HOLD" },           // phase=recording, sessionMode=ptt
     { type: "OPEN_DONE", kind: "ptt" },
   ]).state;
   assert.equal(recording.phase, "recording");
@@ -481,6 +481,7 @@ test("stale AGENT_END from cancelled turn does not reset phase while new STT is 
     { type: "TRANSCRIPT" },
     { type: "TTS_START" },
     { type: "PCM_FIRST" },         // mid-speech: thinking=true, speaking=true
+    { type: "TAP" },               // mid-turn pause first (HOLD-from-live is no-op)
     { type: "HOLD" },              // PTT barge cancels TTS, sessionMode=ptt, phase=recording
     { type: "OPEN_DONE", kind: "ptt" },
     { type: "RELEASE" },           // sessionMode=pause, pendingClose=transcribing, phase=paused
@@ -520,6 +521,7 @@ test("barge-in spans LLM completion: HOLD mid-speaking, AGENT_END arrives while 
     { type: "LLM_TEXT" },
     { type: "TTS_START" },
     { type: "PCM_FIRST" },             // phase=speaking
+    { type: "TAP" },                   // mid-turn pause (HOLD-from-live is no-op)
     { type: "HOLD" },                  // PTT barge — cancelInFlight, phase=recording
     { type: "OPEN_DONE", kind: "ptt" },
   ]).state;
@@ -567,6 +569,7 @@ test("AGENT_END arriving after an interrupt does not flip phase back", () => {
     { type: "VAD_SPEECH_START" },
     { type: "VAD_SPEECH_END" },
     { type: "TRANSCRIPT" },
+    { type: "TAP" }, // mid-turn pause (HOLD-from-live is no-op)
     { type: "HOLD" }, // PTT barge-in cancels the LLM
     { type: "OPEN_DONE", kind: "ptt" },
   ]).state;
