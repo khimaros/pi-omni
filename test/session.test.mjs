@@ -146,3 +146,150 @@ test("WebSession handles disconnect/close by triggering onDeactivate via dispose
   assert.equal(calls.deactivated.length, 1, "Must trigger onDeactivate on dispose");
   assert.equal(calls.deactivated[0], session);
 });
+
+// ─── barge-in during transcribing: concurrent finishUtterance race ──
+
+// Controllable mock OpenAI client: each call to transcribe() returns a
+// deferred promise that the test resolves manually, controlling the
+// order in which concurrent STT calls complete.
+function makeDeferredSttClient() {
+  const calls = [];
+  const client = {
+    audio: {
+      transcriptions: {
+        create: () => {
+          let resolve, reject;
+          const promise = new Promise((res, rej) => {
+            resolve = res;
+            reject = rej;
+          });
+          calls.push({ resolve, reject, promise });
+          return promise;
+        },
+      },
+    },
+  };
+  return { client, calls };
+}
+
+// Generate a minimal WAV header for 16kHz 16-bit mono PCM so
+// finishUtterance doesn't bail out on empty pcm. Content doesn't
+// matter since STT is mocked.
+function dummyPcm(bytes = 320) {
+  return Buffer.alloc(bytes, 0x42);
+}
+
+// finishUtterance() awaits toFile() before calling client.audio.
+// transcriptions.create, so the mock isn't invoked synchronously.
+// One macrotask is enough to flush the chain past toFile.
+function flushMicrotasks() {
+  return new Promise((r) => setTimeout(r, 10));
+}
+
+test("barge-in during transcribing: stale STT completing last clobbers new request", async () => {
+  // This test reproduces the race condition where the user barges in
+  // during transcribing and the second (current) STT returns before
+  // the first (stale) STT. The stale sendUserMessage then aborts the
+  // current prompt.
+  const { client, calls: sttCalls } = makeDeferredSttClient();
+  const sentMessages = [];
+  const ws = new MockWebSocket();
+  const { deps } = makeSessionDeps();
+  deps.client = client;
+  // Mirror the production connection wrapper: rearmTurn before each
+  // prompt so the lifecycle stays active for the new turn's deltas.
+  let session;
+  deps.sendUserMessage = (text) => {
+    session.rearmTurn();
+    sentMessages.push(text);
+  };
+  session = new WebSession(ws, deps);
+  ws.sent = []; // clear hello
+
+  // Simulate first utterance: audio_start → pcm → audio_end.
+  ws.emit("message", JSON.stringify({ type: "audio_start" }), false);
+  ws.emit("message", dummyPcm(), true);
+  ws.emit("message", JSON.stringify({ type: "audio_end", sampleRate: 16000 }), false);
+  await flushMicrotasks();
+
+  // finishUtterance #1 is now awaiting STT.
+  assert.equal(sttCalls.length, 1, "first audio_end should trigger STT");
+
+  // Barge-in: audio_start clears pcmChunks, new pcm, audio_end.
+  ws.emit("message", JSON.stringify({ type: "audio_start" }), false);
+  ws.emit("message", dummyPcm(), true);
+  ws.emit("message", JSON.stringify({ type: "audio_end", sampleRate: 16000 }), false);
+  await flushMicrotasks();
+
+  // finishUtterance #2 is now also awaiting STT.
+  assert.equal(sttCalls.length, 2, "second audio_end should trigger another STT");
+
+  // Second STT returns first (shorter audio, faster to transcribe).
+  sttCalls[1].resolve({ text: "new request" });
+  await flushMicrotasks();
+
+  // First (stale) STT returns after.
+  sttCalls[0].resolve({ text: "old request" });
+  await flushMicrotasks();
+
+  // BUG: without a guard, both texts are sent to sendUserMessage.
+  // The stale "old request" arrives LAST and clobbers the "new request"
+  // that was already processing. The fix must ensure only the most
+  // recent utterance's text is forwarded.
+  assert.equal(sentMessages.length, 1,
+    "only the most recent utterance should be sent to sendUserMessage");
+  assert.equal(sentMessages[0], "new request",
+    "the new request must be the one sent, not the stale old request");
+});
+
+test("barge-in during transcribing: stale STT returning empty does not break new request", async () => {
+  // Variant: first STT returns empty (false-positive VAD) while second
+  // STT returns valid text. The revert() for the empty result must not
+  // corrupt the turn lifecycle for the second request.
+  const { client, calls: sttCalls } = makeDeferredSttClient();
+  const sentMessages = [];
+  const ws = new MockWebSocket();
+  const { deps } = makeSessionDeps();
+  deps.client = client;
+  // Mirror the production connection wrapper: rearmTurn before each
+  // prompt so the lifecycle stays active for the new turn's deltas.
+  let session;
+  deps.sendUserMessage = (text) => {
+    session.rearmTurn();
+    sentMessages.push(text);
+  };
+  session = new WebSession(ws, deps);
+  ws.sent = []; // clear hello
+
+  // First utterance.
+  ws.emit("message", JSON.stringify({ type: "audio_start" }), false);
+  ws.emit("message", dummyPcm(), true);
+  ws.emit("message", JSON.stringify({ type: "audio_end", sampleRate: 16000 }), false);
+  await flushMicrotasks();
+  assert.equal(sttCalls.length, 1);
+
+  // Barge-in: second utterance.
+  ws.emit("message", JSON.stringify({ type: "audio_start" }), false);
+  ws.emit("message", dummyPcm(), true);
+  ws.emit("message", JSON.stringify({ type: "audio_end", sampleRate: 16000 }), false);
+  await flushMicrotasks();
+  assert.equal(sttCalls.length, 2);
+
+  // First STT returns empty (VAD false positive).
+  sttCalls[0].resolve({ text: "" });
+  await flushMicrotasks();
+
+  // Second STT returns with real text.
+  sttCalls[1].resolve({ text: "hello world" });
+  await flushMicrotasks();
+
+  // The second (current) request must still be processed.
+  assert.equal(sentMessages.length, 1, "valid second utterance must be processed");
+  assert.equal(sentMessages[0], "hello world");
+
+  // Verify the turn lifecycle is in a healthy state: LLM events should
+  // be forwarded (turn is active).
+  assert.equal(session.voiceTurnInFlight, true,
+    "turn must be active after processing the second utterance");
+});
+

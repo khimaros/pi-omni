@@ -1108,3 +1108,108 @@ test("real AGENT_END (after activity, no text) still regresses to resting + plac
   assert.equal(state.thinking, false);
   assert.ok(hasAction(actions, "SHOW_PLACEHOLDER"));
 });
+
+// ─── barge-in during transcribing ──────────────────────────────────
+// When the user starts speaking again while the previous utterance's
+// STT is still running on the server. The client sends audio_start
+// (barge-in), new PCM, then audio_end. The server now has two
+// concurrent finishUtterance() calls. If the second STT returns
+// before the first, the first (stale) result must not clobber the
+// second (current) one.
+
+test("VAD_SPEECH_START during transcribing transitions to recording and sends audio_start", () => {
+  const transcribing = run([
+    { type: "TAP" },
+    { type: "OPEN_DONE", kind: "live" },
+    { type: "VAD_SPEECH_START" },
+    { type: "VAD_SPEECH_END" }, // → transcribing
+  ]).state;
+  assert.equal(transcribing.phase, "transcribing");
+
+  const { state, actions } = reduce(transcribing, { type: "VAD_SPEECH_START" });
+  assert.equal(state.phase, "recording");
+  assert.equal(state.vadSpeaking, true);
+  // Must send audio_start so the server starts collecting new PCM.
+  const audioStart = actions.find((a) => a.type === "WS_SEND" && a.msg.type === "audio_start");
+  assert.ok(audioStart, "barge-in during transcribing must send audio_start");
+  // Arp should stop (transcribing → recording leaves ARP_PHASES).
+  assert.ok(hasAction(actions, "ARP_STOP"), "arp must stop on barge-in from transcribing");
+});
+
+test("barge-in during transcribing: full cycle returns to listening", () => {
+  // User speaks, VAD ends (transcribing), user speaks again (barge),
+  // second VAD ends (transcribing again), first STT's TRANSCRIPT
+  // arrives, then second STT's TRANSCRIPT arrives, then the second
+  // turn plays its response and settles.
+  const { state, actions } = run([
+    { type: "TAP" },
+    { type: "OPEN_DONE", kind: "live" },
+    // First utterance.
+    { type: "VAD_SPEECH_START" },
+    { type: "VAD_SPEECH_END" },        // → transcribing
+    // Barge-in during STT.
+    { type: "VAD_SPEECH_START" },       // → recording (barge)
+    { type: "VAD_SPEECH_END" },         // → transcribing (second utterance)
+    // First STT returns — stale TRANSCRIPT, but still processes.
+    { type: "TRANSCRIPT" },             // → thinking
+    // Second STT returns — real TRANSCRIPT for the new utterance.
+    { type: "TRANSCRIPT" },             // resets gotText/sawTurnActivity
+    // Normal turn lifecycle for the second (current) utterance.
+    { type: "COMPONENT" },
+    { type: "LLM_TEXT" },
+    { type: "TTS_START" },
+    { type: "PCM_FIRST" },
+    { type: "TTS_END" },
+    { type: "AGENT_END" },
+    { type: "WORKLET_DRAINED" },
+  ]);
+  assert.equal(state.phase, "listening");
+  assert.equal(state.thinking, false);
+  assert.equal(state.speaking, false);
+});
+
+test("barge-in during transcribing: second TRANSCRIPT resets turn tracking", () => {
+  // When two TRANSCRIPTs arrive (from concurrent STT), each one must
+  // reset gotText and sawTurnActivity so the final AGENT_END applies
+  // placeholder logic to the SECOND (current) turn, not the first.
+  const afterBarge = run([
+    { type: "TAP" },
+    { type: "OPEN_DONE", kind: "live" },
+    { type: "VAD_SPEECH_START" },
+    { type: "VAD_SPEECH_END" },        // → transcribing
+    { type: "VAD_SPEECH_START" },       // barge → recording
+    { type: "VAD_SPEECH_END" },         // → transcribing
+    // First (stale) STT returns.
+    { type: "TRANSCRIPT" },             // → thinking, resets gotText
+    { type: "COMPONENT" },              // sawTurnActivity=true (from stale turn)
+    // Second (current) STT returns.
+    { type: "TRANSCRIPT" },             // MUST reset sawTurnActivity
+  ]).state;
+  assert.equal(afterBarge.gotText, false, "second TRANSCRIPT must reset gotText");
+  assert.equal(afterBarge.sawTurnActivity, false,
+    "second TRANSCRIPT must reset sawTurnActivity so stale activity doesn't satisfy placeholder guard");
+});
+
+test("barge-in during transcribing: AGENT_END from first (stale) turn is no-op", () => {
+  // The first utterance's LLM finishes (AGENT_END) while the second
+  // utterance is still processing. This stale AGENT_END must not
+  // regress phase or stop the arp.
+  const thinking = run([
+    { type: "TAP" },
+    { type: "OPEN_DONE", kind: "live" },
+    { type: "VAD_SPEECH_START" },
+    { type: "VAD_SPEECH_END" },
+    { type: "VAD_SPEECH_START" },       // barge during transcribing
+    { type: "VAD_SPEECH_END" },         // → transcribing (second)
+    { type: "TRANSCRIPT" },             // first STT → thinking
+    // Stale AGENT_END from first turn's LLM completing.
+    { type: "AGENT_END" },
+    // Second STT → TRANSCRIPT resets state for second turn.
+    { type: "TRANSCRIPT" },
+  ]).state;
+  assert.equal(thinking.phase, "thinking");
+  assert.equal(thinking.thinking, true);
+  assert.equal(thinking.sawTurnActivity, false,
+    "second TRANSCRIPT must clear sawTurnActivity regardless of stale AGENT_END");
+});
+

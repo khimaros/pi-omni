@@ -54,6 +54,12 @@ export class WebSession {
   private tts: TtsPlayer;
   private pcmChunks: Buffer[] = [];
   private utteranceRate = 16000;
+  // Monotonic per-utterance sequence. Bumped on every audio_end and
+  // captured by finishUtterance() before awaiting STT, so a stale
+  // (slower) transcription whose epoch has been superseded by a
+  // barge-in audio_end gets discarded instead of clobbering the
+  // current turn.
+  private utteranceSeq = 0;
   private chunker = new SentenceChunker();
   private sawDeltasThisTurn = false;
   private turn = new TurnLifecycle();
@@ -247,9 +253,10 @@ export class WebSession {
         // client, which shows a misleading "(no response)" before the
         // new turn's response arrives. finishUtterance() will revert
         // if STT comes back empty.
-        this.log(`audio_end → turn.begin (isActive=${this.turn.isActive})`);
+        this.utteranceSeq += 1;
+        this.log(`audio_end → turn.begin (isActive=${this.turn.isActive}, seq=${this.utteranceSeq})`);
         this.turn.begin();
-        void this.finishUtterance();
+        void this.finishUtterance(this.utteranceSeq);
         break;
       case "cancel":
         this.tts.cancel();
@@ -267,7 +274,7 @@ export class WebSession {
     this.pcmChunks.push(pcm);
   }
 
-  private async finishUtterance(): Promise<void> {
+  private async finishUtterance(seq: number): Promise<void> {
     const pcm = Buffer.concat(this.pcmChunks);
     this.pcmChunks = [];
     if (!pcm.length) {
@@ -280,7 +287,22 @@ export class WebSession {
     try {
       text = (await transcribe(this.deps.client, wav, this.deps.cfg.sttModel)).trim();
     } catch (e) {
+      // Stale STT errors also get dropped — a newer utterance owns the turn.
+      if (seq !== this.utteranceSeq) {
+        this.log(`stale STT error dropped (seq=${seq}, current=${this.utteranceSeq})`);
+        return;
+      }
       this.sendJson({ type: "error", message: `STT: ${(e as Error).message}` });
+      return;
+    }
+    // Barge-in race: another audio_end has arrived while we awaited
+    // STT, so this transcription is stale. The newer utterance's
+    // finishUtterance owns the turn lifecycle (begin() already replaced
+    // ours and bumped pendingStaleEnds). Drop silently — do NOT revert,
+    // do NOT send transcript, do NOT call sendUserMessage. Otherwise
+    // the old text clobbers the new prompt and the lifecycle desyncs.
+    if (seq !== this.utteranceSeq) {
+      this.log(`stale STT dropped (seq=${seq}, current=${this.utteranceSeq}, text=${JSON.stringify(text.slice(0, 40))})`);
       return;
     }
     if (!text) {

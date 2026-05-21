@@ -11,6 +11,15 @@
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="pi-omni" />
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(err => {
+        console.error('sw registration failed:', err);
+      });
+    });
+  }
+</script>
 <style>
   :root {
     --bg: #0f0d12;
@@ -111,15 +120,21 @@
      an idle orb → blue (you're about to enable); hovering an active orb
      → dim (you're about to mute). Hover is scoped to .dot so the effect
      only fires inside the visible disc — #orb is flex:1 and otherwise
-     would trigger from anywhere in the layout column. */
-  body.mic-on .orb-glyph-css .glyph .g-wave i,
-  body:not(.mic-on) #orb .dot:hover .glyph .g-wave i,
-  body:not(.mic-on) #start-orb:not(.disabled) .dot:hover .glyph .g-wave i {
+     would trigger from anywhere in the layout column. Hover toggles are
+     gated by (hover: hover) so touch devices don't get a sticky :hover
+     after a tap, which would invert the displayed state. */
+  body.mic-on .orb-glyph-css .glyph .g-wave i {
     background: var(--user);
   }
-  body.mic-on #orb .dot:hover .glyph .g-wave i,
-  body.mic-on #start-orb:not(.disabled) .dot:hover .glyph .g-wave i {
-    background: var(--dim);
+  @media (hover: hover) and (pointer: fine) {
+    body:not(.mic-on) #orb .dot:hover .glyph .g-wave i,
+    body:not(.mic-on) #start-orb:not(.disabled) .dot:hover .glyph .g-wave i {
+      background: var(--user);
+    }
+    body.mic-on #orb .dot:hover .glyph .g-wave i,
+    body.mic-on #start-orb:not(.disabled) .dot:hover .glyph .g-wave i {
+      background: var(--dim);
+    }
   }
   .orb-glyph-css .glyph .g-wave i:nth-child(1),
   .orb-glyph-css .glyph .g-wave i:nth-child(5) { height: 28px; }
@@ -176,14 +191,15 @@
   }
   body.error #status { color: var(--error); }
   /* While the WS is down both orbs ignore input (handlers early-return on
-     body.reconnecting); the dim + progress cursor signals that. */
+     body.reconnecting). We keep the red error glow visible (set in
+     parallel by body.error) and the status text in error red so the
+     "reconnecting" state reads as a real fault, not just a dim idle. */
   body.reconnecting #orb .dot,
   body.reconnecting #start-orb .dot {
-    opacity: 0.45;
     cursor: progress;
     pointer-events: none;
   }
-  body.reconnecting #status { color: var(--dim); }
+  body.reconnecting #status { color: var(--error); }
   #transcript {
     color: var(--user);
     font-size: 14px;

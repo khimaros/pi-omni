@@ -13,6 +13,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 // At runtime we're under dist/server/, so browser assets are at <pkg>/public/.
 const CLIENT_DIR = resolve(__dirname, "..", "..", "public");
+const PKG_VERSION: string = require(resolve(__dirname, "..", "..", "package.json")).version;
 
 // Resolve a dep's on-disk root by resolving its main entry and walking up to
 // the nearest package.json. Avoids `<pkg>/package.json` import which is gated
@@ -213,6 +214,19 @@ async function handleHttp(
     path = path.replace(/^\/+/, "").replace(/\.\.+/g, "");
     const filePath = join(CLIENT_DIR, path);
     if (!filePath.startsWith(CLIENT_DIR)) return notFound(res, rawPath, log);
+    // sw.js carries the cache version — substitute __VERSION__ from package.json
+    // so a release bump invalidates the precache without a manual edit.
+    if (path === "sw.js") {
+      const src = await readFile(filePath, "utf8").catch(() => null);
+      if (src === null) return notFound(res, filePath, log);
+      const body = src.replace(/__VERSION__/g, PKG_VERSION);
+      res.writeHead(200, {
+        "Content-Type": MIME[".js"],
+        "Cache-Control": "no-store",
+      });
+      res.end(body);
+      return;
+    }
     return await serveFile(res, filePath, "no-store", log);
   } catch (e) {
     log(`web: request error for ${req.url}: ${(e as Error).message}`, "warning");

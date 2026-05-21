@@ -337,3 +337,50 @@ test("if drain never fires, new turn's natural end is still natural (not cancell
   assert.equal(t.end(), "natural",
     "new turn's natural end must classify as natural even if prior drain was lost");
 });
+
+// ─── concurrent finishUtterance (barge-in during transcribing) ──────
+// When the user barges in during transcribing, two audio_end messages
+// arrive and two finishUtterance() calls run concurrently. Each
+// audio_end calls turn.begin(). If the first STT returns empty, its
+// revert() call may undo the wrong begin() because lastBeginAddedStale
+// tracks only the most recent begin().
+
+test("two begin()s then first revert: must not corrupt state for second", () => {
+  // Simulates: first audio_end → begin(), second audio_end → begin(),
+  // first STT returns empty → revert(). The second begin's turn must
+  // still be processable.
+  const t = new TurnLifecycle();
+  t.begin();                            // first audio_end
+  t.begin();                            // second audio_end — replaces first
+  // First STT returns empty — calls revert(). revert should undo the
+  // FIRST begin, not the second. But lastBeginAddedStale was set by
+  // the second begin(), so revert() uses the wrong state.
+  t.revert();
+  // After revert, we need the lifecycle to be in a state where the
+  // second finishUtterance (which will call rearm + send to LLM)
+  // can proceed correctly.
+  assert.equal(t.isActive, true,
+    "lifecycle must be active so second utterance's events are forwarded");
+  // Second STT completes with text → rearm + end should work.
+  t.rearm();
+  assert.equal(t.isActive, true);
+  assert.equal(t.end(), "natural",
+    "second utterance's natural end must classify correctly");
+});
+
+test("two begin()s then second revert: lifecycle stays consistent", () => {
+  // Variant: second STT returns empty (second was a VAD misfire).
+  // First utterance should still be processable.
+  const t = new TurnLifecycle();
+  t.begin();                            // first audio_end
+  t.begin();                            // second audio_end
+  // Second STT returns empty first.
+  // But revert() doesn't know which begin() it's reverting — it
+  // always reverts the most recent one (via lastBeginAddedStale).
+  t.revert();
+  // First STT completes with text — needs rearm + prompt.
+  t.rearm();
+  assert.equal(t.isActive, true);
+  assert.equal(t.end(), "natural");
+});
+

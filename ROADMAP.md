@@ -14,6 +14,7 @@
 ## done
 
 ```
+[x] fix barge-in during transcribing: concurrent finishUtterance can drop new request
 [x] simplify autostart logic and fix onboarding hint visibility on new session
 [x] expand test coverage for session preservation, deletion, and connection state changes
 [x] support WebSocket disconnect/reconnect session preservation and new session action
