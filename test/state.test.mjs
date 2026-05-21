@@ -74,7 +74,10 @@ test("TAP from live closes to paused with chime + mic close", () => {
   assert.equal(state.sessionMode, "pause");
   assert.equal(state.phase, "paused");
   assert.equal(state.pendingClose, null); // no follow-up needed
-  assert.deepEqual(actionTypes(actions), ["CLOSE_LIVE", "RELEASE_MIC"]);
+  // CLOSE_LIVE owns the mic release; the auto-RELEASE_MIC from withPhase
+  // is suppressed when a close action is already in the pipeline so the
+  // release doesn't race ahead and pause the mic mid-chime.
+  assert.deepEqual(actionTypes(actions), ["CLOSE_LIVE"]);
 });
 
 test("CLOSE_DONE after pause-from-live stays in paused (no flush)", () => {
@@ -99,14 +102,13 @@ test("TAP from live during mid-utterance flushes VAD buffer", () => {
   assert.equal(state.phase, "paused"); // glow cleared immediately
   assert.equal(state.vadSpeaking, false);
   assert.equal(state.pendingClose, "transcribing");
-  // Flush before close.
+  // Flush before close. CLOSE_LIVE owns the mic release — no parallel
+  // RELEASE_MIC (see "TAP from live closes to paused" for the rationale).
   assert.deepEqual(actionTypes(actions), [
-    "ARP_STOP", // we were in recording? actually recording is NOT in ARP_PHASES, so no.
     "WS_FLUSH_VAD",
     "WS_SEND",
     "CLOSE_LIVE",
-    "RELEASE_MIC",
-  ].filter((t) => t !== "ARP_STOP")); // recording is not arp, expect no ARP_STOP
+  ]);
 });
 
 test("CLOSE_DONE after mid-utterance pause advances to transcribing (and starts arp)", () => {

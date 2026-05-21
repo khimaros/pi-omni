@@ -112,9 +112,15 @@ function withPhase(state, newPhase, extraActions = []) {
   else if (wasArp && !isArp) arpActions.push({ type: "ARP_STOP" });
 
   // Deferred mic release: if we just moved to a resting phase while in
-  // pause mode, and the mic is still open, close it now.
+  // pause mode, and the mic is still open, close it now. Skip when the
+  // caller is already emitting a CLOSE_* action — that close path runs
+  // the chime BEFORE releasing the mic, and a parallel RELEASE_MIC
+  // would race ahead and pause the mic mid-chime, clipping it.
   const isActive = isArp || newPhase === "speaking";
-  if (state.sessionMode === "pause" && state.micOpen && !isActive) {
+  const alreadyClosing = extraActions.some(
+    (a) => a.type === "CLOSE_LIVE" || a.type === "CLOSE_PTT" || a.type === "RELEASE_MIC",
+  );
+  if (state.sessionMode === "pause" && state.micOpen && !isActive && !alreadyClosing) {
     extraActions.push({ type: "RELEASE_MIC" });
   }
 

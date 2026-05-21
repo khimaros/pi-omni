@@ -34,6 +34,11 @@ const CHIME_TAIL_PAUSE_MS = 200;   // silence after chime before next side-effec
 // tracks dead, but the OS audio-routing reconfigure continues
 // asynchronously — playing anything during that window clips the onset.
 const MIC_OFF_SETTLE_MS = 120;
+// Mirror of MIC_OFF_SETTLE_MS for the open direction: after the mic
+// hardware comes up, wait for the OS audio session to settle into its
+// new route before playing the open chime, so the chime onset doesn't
+// get clipped by an in-flight session renegotiation.
+const MIC_ON_SETTLE_MS = 120;
 // Wait after AudioContext.resume() before scheduling playback. Mobile
 // browsers need a moment for the OS audio session to re-route after
 // being interrupted by a capture-context close.
@@ -299,7 +304,29 @@ async function playChime(reverse) {
   const notes = reverse ? [1046.5, 783.99] : [783.99, 1046.5];
   const noteDur = 0.16;
   const stagger = 0.09;
-  const leadSec = 0.005;
+  // Audio session warmup. iOS (and some Android browsers) put the audio
+  // session into a low-power "idle" state when nothing has played for a
+  // few seconds. The next sound's first ~50-80ms is then fade-in ramped
+  // by the OS, swallowing the chime's onset. Schedule an inaudible
+  // sub-audible tone for `warmupSec` ahead of the chime so the session
+  // is fully active by the time the chime's first note begins. Skipped
+  // when blending into the arp (audio session is already warm).
+  const warmupSec = blend ? 0 : 0.10;
+  if (warmupSec > 0) {
+    const warmStart = playerCtx.currentTime;
+    const warmOsc = playerCtx.createOscillator();
+    warmOsc.frequency.value = 60;
+    const warmGain = playerCtx.createGain();
+    warmGain.gain.value = 0.0001;
+    warmOsc.connect(warmGain);
+    warmGain.connect(dest);
+    warmOsc.start(warmStart);
+    warmOsc.stop(warmStart + warmupSec + 0.02);
+  }
+  // leadSec sits well above the audio thread's quantum so the t0 ramp
+  // never lands in the past, AND past the warmup so the OS audio
+  // session has finished its idle-to-active ramp before the chime hits.
+  const leadSec = warmupSec + 0.040;
   const now = playerCtx.currentTime + leadSec;
   for (let i = 0; i < notes.length; i++) {
     const t0 = now + i * stagger;
@@ -403,61 +430,90 @@ class Arpeggiator {
 }
 
 // === Open / close composites =================================================
-async function openLive() {
+//
+// PTT and live VAD share the same lifecycle shape, so they share the
+// same orchestration. The non-obvious part is the chime ordering:
+//
+//   open:  acquire mic → settle → chime → open capture gate → OPEN_DONE
+//   close: (gate already closed by reducer) → chime → release → CLOSE_DONE
+//
+// Playing the chime while the mic hardware is hot keeps the OS audio
+// session in a stable record+play route for the duration of the chime
+// — without this, the route renegotiation on mobile clips the chime's
+// onset. Frames that arrive during the open chime are kept out of the
+// utterance by the `pendingOpen` gate in the PTT processor / VAD
+// callbacks; ptt.reset() before OPEN_DONE adds a defensive clear.
+
+async function openMicLifecycle({ sessionMode, prepare, acquire, onReady }) {
   if (startPromise) {
     try { await startPromise; }
     catch { dispatch({ type: "OPEN_ERROR", message: "start failed" }); return; }
   }
   try {
+    if (prepare) await prepare();
+    if (state.sessionMode !== sessionMode) return;
+    await acquire();
+    await new Promise((r) => setTimeout(r, MIC_ON_SETTLE_MS));
     await playChimeAndPause(false);
-    if (state.sessionMode !== "live") return; // user toggled away
-    await ensureLiveMic();
-    dispatch({ type: "OPEN_DONE", kind: "live" });
+    if (state.sessionMode !== sessionMode) return;
+    onReady?.();
+    dispatch({ type: "OPEN_DONE", kind: sessionMode });
   } catch (e) {
-    console.error("[live] mic init failed:", e);
+    console.error(`[${sessionMode}] mic init failed:`, e);
     dispatch({ type: "OPEN_ERROR", message: `mic: ${e.message ?? e}` });
   }
+}
+
+async function closeMicLifecycle({ release, getHadAudio = () => true }) {
+  await playChimeAndPause(true);
+  await release();
+  dispatch({ type: "CLOSE_DONE", hadAudio: getHadAudio() });
+}
+
+async function openLive() {
+  return openMicLifecycle({ sessionMode: "live", acquire: ensureLiveMic });
 }
 
 async function openPtt(fromLive) {
-  if (startPromise) {
-    try { await startPromise; }
-    catch { dispatch({ type: "OPEN_ERROR", message: "start failed" }); return; }
-  }
-  // Silently pause the live mic if it's running — don't chime, the PTT
-  // open chime will play in a moment.
-  if (fromLive && micVad) {
-    try { await micVad.pause(); } catch {}
-    vadBuffer = [];
-    vadEndAudio = null;
-    await new Promise((r) => setTimeout(r, MIC_OFF_SETTLE_MS));
-  }
-  try {
-    await playChimeAndPause(false);
-    if (state.sessionMode !== "ptt") return;
-    await ensurePttMic();
-    if (pttCtx.state === "suspended") { try { await pttCtx.resume(); } catch {} }
-    ptt.reset();
-    dispatch({ type: "OPEN_DONE", kind: "ptt" });
-  } catch (e) {
-    console.error("[ptt] mic init failed:", e);
-    dispatch({ type: "OPEN_ERROR", message: `mic: ${e.message ?? e}` });
-  }
+  return openMicLifecycle({
+    sessionMode: "ptt",
+    // Coming from live mode, silently pause the VAD mic before opening
+    // PTT — no chime, the PTT open chime will play in a moment.
+    prepare: async () => {
+      if (fromLive && micVad) {
+        try { await micVad.pause(); } catch {}
+        vadBuffer = [];
+        vadEndAudio = null;
+        await new Promise((r) => setTimeout(r, MIC_OFF_SETTLE_MS));
+      }
+    },
+    acquire: async () => {
+      await ensurePttMic();
+      if (pttCtx?.state === "suspended") { try { await pttCtx.resume(); } catch {} }
+    },
+    onReady: () => ptt.reset(),
+  });
 }
 
 async function closeLive() {
-  await releaseLiveMic();
-  await playChimeAndPause(true);
-  dispatch({ type: "CLOSE_DONE", hadAudio: true });
+  return closeMicLifecycle({ release: releaseLiveMic });
+}
+
+async function closePtt() {
+  // getHadAudio is read AFTER the chime/release awaits resolve, so it
+  // observes the post-flush value. flush() runs synchronously between
+  // CLOSE_PTT and audio_end in the RELEASE reducer's action list — by
+  // the time closeMicLifecycle's first await yields, flush has already
+  // populated hadAudio.
+  return closeMicLifecycle({
+    release: releasePttMic,
+    getHadAudio: () => ptt.consumeHadAudio(),
+  });
 }
 
 async function releaseMicAction() {
   await releaseLiveMic();
   dispatch({ type: "CLOSE_DONE", hadAudio: true });
-}
-
-async function closePtt() {
-  await ptt.close();
 }
 
 async function releaseLiveMic() {
@@ -603,22 +659,26 @@ async function initMic() {
     minSpeechFrames: 16,
     redemptionFrames: 6,
     preSpeechPadFrames: 3,
+    // pendingOpen gates VAD events during the open chime — mirrors the
+    // PTT processor's pendingOpen gate. Without it, a VAD speech-start
+    // during the chime would transition the phase out from under the
+    // open lifecycle.
     onFrameProcessed: (_probs, frame) => {
       if (state.vadSpeaking) vadBuffer.push(new Float32Array(frame));
     },
     onSpeechStart: () => {
-      if (!ws || ws.readyState !== 1) return;
+      if (!ws || ws.readyState !== 1 || state.pendingOpen) return;
       vadBuffer = [];
       vadEndAudio = null;
       dispatch({ type: "VAD_SPEECH_START" });
     },
     onSpeechEnd: (audio) => {
-      if (!ws || ws.readyState !== 1) return;
+      if (!ws || ws.readyState !== 1 || state.pendingOpen) return;
       vadEndAudio = audio;
       dispatch({ type: "VAD_SPEECH_END" });
     },
     onVADMisfire: () => {
-      if (!ws || ws.readyState !== 1) return;
+      if (!ws || ws.readyState !== 1 || state.pendingOpen) return;
       vadBuffer = [];
       vadEndAudio = null;
       dispatch({ type: "VAD_MISFIRE" });
@@ -638,9 +698,6 @@ let pttSource = null;
 let pttProcessor = null;
 const ptt = createPtt({
   sendUtterance: (f32) => sendUtterance(f32),
-  releaseMic: () => releasePttMic(),
-  playChimeAndPause: () => playChimeAndPause(true),
-  dispatch: (event) => dispatch(event),
 });
 
 async function ensurePttMic() {
@@ -659,7 +716,11 @@ async function ensurePttMic() {
   pttSource = pttCtx.createMediaStreamSource(pttStream);
   pttProcessor = pttCtx.createScriptProcessor(2048, 1, 1);
   pttProcessor.onaudioprocess = (e) => {
-    if (!state.pttHeld) return;
+    // pendingOpen gates capture during the open chime (mic hardware is
+    // hot but we haven't opened the gate yet). pttHeld stops capture as
+    // soon as the user releases — RELEASE clears it synchronously in
+    // the reducer, before CLOSE_PTT runs.
+    if (!state.pttHeld || state.pendingOpen) return;
     ptt.push(new Float32Array(e.inputBuffer.getChannelData(0)));
   };
   pttSource.connect(pttProcessor);
