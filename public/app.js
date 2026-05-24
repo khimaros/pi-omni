@@ -663,8 +663,12 @@ async function initMic() {
   let firstFrame;
   const firstFrameReady = new Promise((r) => { firstFrame = r; });
   let firstFrameSeen = false;
+  // Let MicVAD own its capture AudioContext. Sharing playerCtx put a mic
+  // input on the playback context, which forces mobile browsers into
+  // voice-communication mode (lower rate, tiny buffers, output AEC) and
+  // makes everything routed through it choppy — the arp worst of all,
+  // since its multi-node envelopes underrun before the cheap pcm copy.
   micVad = await window.vad.MicVAD.new({
-    audioContext: playerCtx,
     model: "v5",
     baseAssetPath: "/vendor/vad-web/",
     onnxWASMBasePath: "/vendor/ort/",
@@ -779,9 +783,15 @@ function openWs(isReconnect = false) {
     let settled = false;
     ws.addEventListener("open", () => {
       reconnectDelayMs = 500;
+      const wasReconnecting = document.body.classList.contains("reconnecting");
       setBodyState("error", false);
       setBodyState("reconnecting", false);
       dispatch({ type: "WS_OPEN" });
+      // WS_OPEN doesn't move phase, so applyState won't refresh the status
+      // text. Without this, resetSessionState()'s stale "reconnecting" text
+      // survives the reopen and gets painted in the lingering phase color
+      // (e.g. thinking amber) — a yellow "reconnecting".
+      if (wasReconnecting) setStatus(state.phase);
       settled = true;
       resolve();
     });

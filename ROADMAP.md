@@ -8,8 +8,13 @@
     frames so capture begins exactly when start chime ends and stops
     immediately before end chime begins. eliminates os-level audio-session
     renegotiation and the fragile mic-on settle delay.
-[x] fix crackling audio on firefox android (playerCtx output underruns):
-    use latencyHint "playback" for a larger output buffer
+[x] fix choppy audio on mobile (regression from b69b20b): VAD no longer
+    shares playerCtx, so a mic input stops forcing the playback context
+    into voice-communication mode. also use latencyHint "playback".
+[x] fix "reconnecting" status showing in the phase color (amber while
+    thinking): on socket reopen the reconnecting class clears but the stale
+    "reconnecting" text lingered, painted by the leftover phase class.
+    re-derive status text from phase when leaving the reconnecting state.
 [ ] PTT during live mode should barge in and return to paused after
 [ ] rename paused to something better, like idle?
 [ ] animate waveform when recording or something?
