@@ -29,20 +29,16 @@ import { createPtt } from "./ptt.js";
 // === Tunables (ms) ===========================================================
 const HOLD_THRESHOLD_MS = 250;     // press duration that promotes tap → PTT
 const CHIME_TAIL_PAUSE_MS = 200;   // silence after chime before next side-effect
-// Wait after stopping the mic before the next audio output can play
-// cleanly. micVad.pause() / track.stop() return as soon as JS marks the
-// tracks dead, but the OS audio-routing reconfigure continues
-// asynchronously — playing anything during that window clips the onset.
-const MIC_OFF_SETTLE_MS = 120;
-// Mirror of MIC_OFF_SETTLE_MS for the open direction: after the mic
-// hardware comes up, wait for the OS audio session to settle into its
-// new route before playing the open chime, so the chime onset doesn't
-// get clipped by an in-flight session renegotiation.
-const MIC_ON_SETTLE_MS = 120;
 // Wait after AudioContext.resume() before scheduling playback. Mobile
-// browsers need a moment for the OS audio session to re-route after
-// being interrupted by a capture-context close.
+// browsers need a moment for the OS audio session to settle after a
+// transition (interrupted/suspended → running) before scheduled
+// oscillators are reliably audible.
 const AUDIO_SESSION_RESUME_MS = 80;
+// Max time to wait on a prefetch response body before assuming the
+// resource is already cached and moving on. Firefox android can hang
+// forever reading a cached response body (see prefetchOne); a hang only
+// happens when the cache is already warm, so the timeout is safe.
+const PREFETCH_BODY_TIMEOUT_MS = 3000;
 
 // === DOM refs ================================================================
 const orbEl = document.getElementById("orb");
@@ -86,22 +82,14 @@ function updateAssistant(event) {
 // Captures every dispatched event + resulting phase/flag transitions and
 // the actions the reducer emitted, with millisecond timestamps relative
 // to page load. Exposed on window.__pilog for in-browser inspection and
-// rendered into the #eventlog DOM element when present. Helps diagnose
-// timing races (stale AGENT_END, late TRANSCRIPT) without a debugger.
+// copied to clipboard via the #debug-copy button (visible when body.debug
+// is set). Helps diagnose timing races on devices without a debugger.
 const LOG_CAP = 200;
 const eventLog = [];
 const logT0 = performance.now();
-const logEl = document.getElementById("eventlog");
 function logEvent(entry) {
   eventLog.push(entry);
   if (eventLog.length > LOG_CAP) eventLog.shift();
-  if (logEl) {
-    const line = document.createElement("div");
-    line.textContent = formatLogLine(entry);
-    logEl.appendChild(line);
-    while (logEl.childNodes.length > LOG_CAP) logEl.removeChild(logEl.firstChild);
-    logEl.scrollTop = logEl.scrollHeight;
-  }
 }
 function formatLogLine(e) {
   const t = e.t.toFixed(0).padStart(6);
@@ -114,16 +102,24 @@ function formatLogLine(e) {
 }
 if (typeof window !== "undefined") {
   window.__pilog = eventLog;
-  // Auto-enable via ?debug=1; toggle live with 'l'.
+  // Debug copy button is shown only when the page is loaded with ?debug=1.
   try {
     if (new URLSearchParams(location.search).get("debug") === "1") {
       document.body.classList.add("debug");
     }
   } catch {}
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "l" && !e.target?.matches?.("input,textarea")) {
-      document.body.classList.toggle("debug");
+  const debugCopyBtn = document.getElementById("debug-copy");
+  debugCopyBtn?.addEventListener("click", async () => {
+    const text = eventLog.map(formatLogLine).join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      debugCopyBtn.classList.add("copied");
+    } catch {
+      debugCopyBtn.classList.add("failed");
     }
+    setTimeout(() => {
+      debugCopyBtn.classList.remove("copied", "failed");
+    }, 1200);
   });
 }
 
@@ -169,10 +165,10 @@ function runAction(action) {
   switch (action.type) {
     case "OPEN_LIVE":     openLive(); break;
     case "OPEN_PTT":      openPtt(); break;
-    case "CLOSE_LIVE":    closeLive(); break;
-    case "CLOSE_PTT":     closePtt(); break;
+    case "CLOSE_LIVE":    captureOpen = false; closeLive(); break;
+    case "CLOSE_PTT":     captureOpen = false; closePtt(); break;
     case "PLAY_CHIME":    playChimeAndPause(action.reverse); break;
-    case "RELEASE_MIC":   releaseMicAction(); break;
+    case "RELEASE_MIC":   captureOpen = false; releaseMicAction(); break;
     case "ARP_START":     arp?.start(); break;
     case "ARP_STOP":      arp?.stop(); break;
     case "WS_SEND":       wsSendJson(action.msg); break;
@@ -195,6 +191,16 @@ let playerCtx = null;
 let playerNode = null;
 let micVad = null;
 let arp = null;
+// Single source of truth for "frames count toward an utterance right now".
+// Flipped to true synchronously after the open chime resolves, and back
+// to false synchronously when a CLOSE_LIVE / CLOSE_PTT / RELEASE_MIC
+// action handler runs — strictly BEFORE the close chime is scheduled or
+// any flush action reads its buffer. Frame-producing paths (PTT
+// processor, VAD callbacks) consult only this flag, never tear the mic
+// hardware down between sessions, so the OS audio-session route stays in
+// record+play permanently after the first acquire — chimes hit a stable
+// route every time and need no timing fudge factor.
+let captureOpen = false;
 // Parallel buffer of VAD-processed frames during a speech segment, used
 // for mid-utterance flush when the user pauses live mid-sentence.
 let vadBuffer = [];
@@ -216,19 +222,9 @@ const PREFETCH = [
   { url: "/vendor/ort/ort-wasm-simd-threaded.wasm", label: "onnx runtime" },
   { url: "/vendor/vad-web/silero_vad_v5.onnx",       label: "vad model" },
 ];
-const prefetchState = PREFETCH.map(() => ({ loaded: 0, total: 0, done: false }));
+const prefetchState = PREFETCH.map(() => ({ done: false }));
 
 function updateProgress() {
-  let loaded = 0, total = 0, allKnown = true;
-  for (const s of prefetchState) {
-    loaded += s.loaded;
-    if (s.total > 0) total += s.total;
-    else allKnown = false;
-  }
-  if (total > 0) {
-    const pct = Math.min(100, Math.round((loaded / total) * 100));
-    setStatus(allKnown ? `downloading ${pct}%` : "downloading");
-  }
   if (prefetchState.every((s) => s.done)) {
     const failures = prefetchState
       .map((s, i) => (s.failed ? PREFETCH[i] : null))
@@ -254,17 +250,21 @@ function updateProgress() {
 async function prefetchOne(i) {
   const { url } = PREFETCH[i];
   try {
+    // We only need the side effect of the browser caching the response,
+    // so we drain the body to force the download to complete. But on
+    // firefox android, reading a *cached* response body can hang forever
+    // (neither resolves nor rejects), which strands the UI at
+    // "downloading" on every soft refresh. A hang only happens when the
+    // resource is already cached — i.e. the cache is already warm and we
+    // don't actually need the body — so race the read against a timeout
+    // and treat the timeout as success. The fetch is left running so a
+    // genuine first-load download still completes and populates the cache.
     const resp = await fetch(url, { cache: "force-cache" });
-    if (!resp.ok || !resp.body) throw new Error(`${resp.status}`);
-    const lenHeader = resp.headers.get("Content-Length");
-    if (lenHeader) prefetchState[i].total = Number(lenHeader);
-    const reader = resp.body.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      prefetchState[i].loaded += value.byteLength;
-      updateProgress();
-    }
+    if (!resp.ok) throw new Error(`${resp.status}`);
+    await Promise.race([
+      resp.arrayBuffer(),
+      new Promise((r) => setTimeout(r, PREFETCH_BODY_TIMEOUT_MS)),
+    ]);
     prefetchState[i].done = true;
     updateProgress();
   } catch (e) {
@@ -289,10 +289,11 @@ if (!window.isSecureContext) {
 // === Chime ===================================================================
 async function playChime(reverse) {
   if (!playerCtx) return;
-  // Mobile capture-context teardown (releasePttMic / VAD pause) parks
-  // playerCtx in "suspended" or "interrupted"; scheduling oscillators
-  // in either state silently no-ops. ensureAudioRunning resumes and
-  // gives the OS audio session a moment to re-route before we schedule.
+  // The mic stays permanently hot now, so playerCtx is normally already
+  // running by chime time. This guard remains for two cases: (a) the
+  // very first chime, scheduled before the first mic acquire, and (b)
+  // an OS-level interrupt (incoming call) that may have parked the
+  // context. ensureAudioRunning resumes if needed before we schedule.
   const preState = playerCtx.state;
   await ensureAudioRunning(playerCtx, AUDIO_SESSION_RESUME_MS);
   const postState = playerCtx.state;
@@ -420,18 +421,29 @@ class Arpeggiator {
 
 // === Open / close composites =================================================
 //
-// PTT and live VAD share the same lifecycle shape, so they share the
-// same orchestration. The non-obvious part is the chime ordering:
+// The mic track is acquired ONCE (per session-mode kind) on the first
+// open and is kept permanently hot from then on. This keeps the OS
+// audio session in a stable record+play route across the entire app
+// lifetime, eliminating the route renegotiation that previously made
+// the open chime fragile on mobile (firefox android).
 //
-//   open:  acquire mic → settle → chime → open capture gate → OPEN_DONE
-//   close: (gate already closed by reducer) → chime → release → CLOSE_DONE
+// Capture is gated entirely by the module-level `captureOpen` flag,
+// flipped at well-defined points in the lifecycle:
 //
-// Playing the chime while the mic hardware is hot keeps the OS audio
-// session in a stable record+play route for the duration of the chime
-// — without this, the route renegotiation on mobile clips the chime's
-// onset. Frames that arrive during the open chime are kept out of the
-// utterance by the `pendingOpen` gate in the PTT processor / VAD
-// callbacks; ptt.reset() before OPEN_DONE adds a defensive clear.
+//   open:  acquire (once) → ensureAudioRunning → OPEN_DONE → start chime → captureOpen=true
+//   close: captureOpen=false (set synchronously by action dispatcher) → end chime → CLOSE_DONE
+//
+// OPEN_DONE fires BEFORE the start chime so the orb visually transitions
+// into the active phase (listening / recording) while the chime is
+// playing — the chime confirms the transition rather than preceding it.
+// Capture still doesn't begin until the chime resolves, gated by
+// `captureOpen` flipping at the very end.
+//
+// Frames start being captured the instant the open chime resolves, and
+// stop being captured the instant the close action is dispatched
+// (strictly before the close chime begins). `release` callbacks are
+// retained only so the reducer can model micOpen, but they perform no
+// actual hardware teardown.
 
 async function openMicLifecycle({ sessionMode, prepare, acquire, onReady }) {
   if (startPromise) {
@@ -439,18 +451,22 @@ async function openMicLifecycle({ sessionMode, prepare, acquire, onReady }) {
     catch { dispatch({ type: "OPEN_ERROR", message: "start failed" }); return; }
   }
   try {
-    // Resume playerCtx before acquire — MicVAD/PTT setup expects a
-    // running context, and we may be coming from a suspended idle state.
     await ensureAudioRunning(playerCtx, AUDIO_SESSION_RESUME_MS);
     if (prepare) await prepare();
     if (state.sessionMode !== sessionMode) return;
+    // First-call only: acquire the mic hardware. Subsequent opens are
+    // no-ops because the track is kept alive for the lifetime of the
+    // page — see the comment on `captureOpen` for the rationale.
     await acquire();
-    await new Promise((r) => setTimeout(r, MIC_ON_SETTLE_MS));
+    if (state.sessionMode !== sessionMode) return;
+    dispatch({ type: "OPEN_DONE", kind: sessionMode });
     await playChimeAndPause(false);
+    // Re-check: user could have closed during the chime, in which case
+    // captureOpen was already flipped to false synchronously and we
+    // must not re-flip it.
     if (state.sessionMode !== sessionMode) return;
     onReady?.();
-    dispatch({ type: "OPEN_DONE", kind: sessionMode });
-    maybeSuspendPlayer();
+    captureOpen = true;
   } catch (e) {
     console.error(`[${sessionMode}] mic init failed:`, e);
     dispatch({ type: "OPEN_ERROR", message: `mic: ${e.message ?? e}` });
@@ -458,27 +474,13 @@ async function openMicLifecycle({ sessionMode, prepare, acquire, onReady }) {
 }
 
 async function closeMicLifecycle({ release, getHadAudio = () => true }) {
+  // captureOpen was already flipped to false synchronously by the action
+  // dispatcher, so any utterance flush in the same action list saw a
+  // clean cutoff and the close chime is about to play on a fully gated
+  // pipeline.
   await playChimeAndPause(true);
   await release();
   dispatch({ type: "CLOSE_DONE", hadAudio: getHadAudio() });
-  maybeSuspendPlayer();
-}
-
-// Suspend playerCtx when no audio is in flight, so mobile browsers
-// don't park the underlying audio stream behind our back (which drops
-// the first ~100ms of the next chime). We re-resume in
-// openMicLifecycle and inside playChime's ensureAudioRunning.
-//
-// Skip when:
-//   - sessionMode is "live": MicVAD shares playerCtx for inference and
-//     stops processing if we suspend.
-//   - phase is anything other than "paused" or "recording": means arp
-//     or TTS is currently scheduled on playerCtx (mid-turn).
-function maybeSuspendPlayer() {
-  if (!playerCtx || playerCtx.state !== "running") return;
-  if (state.sessionMode === "live") return;
-  if (state.phase !== "paused" && state.phase !== "recording") return;
-  try { playerCtx.suspend(); } catch {}
 }
 
 async function openLive() {
@@ -512,31 +514,26 @@ async function closePtt() {
   });
 }
 
+// RELEASE_MIC fires from the reducer when a phase transition ends in a
+// resting state with the mic still flagged open (e.g. TTS completed in
+// pause mode after a barge-in cancel). captureOpen is already false
+// (dispatcher flipped it synchronously); we only need to drain the VAD
+// buffers and let the reducer settle.
 async function releaseMicAction() {
-  await releaseLiveMic();
-  dispatch({ type: "CLOSE_DONE", hadAudio: true });
-  maybeSuspendPlayer();
-}
-
-async function releaseLiveMic() {
-  if (!micVad) return;
-  try { await micVad.pause(); } catch {}
   vadBuffer = [];
   vadEndAudio = null;
-  await new Promise((r) => setTimeout(r, MIC_OFF_SETTLE_MS));
+  dispatch({ type: "CLOSE_DONE", hadAudio: true });
+}
+
+// Close-path release: no hardware teardown. Just drain any in-flight
+// VAD scratch state so the next open starts clean.
+async function releaseLiveMic() {
+  vadBuffer = [];
+  vadEndAudio = null;
 }
 
 async function releasePttMic() {
-  if (!pttCtx) return;
-  try { pttProcessor?.disconnect(); } catch {}
-  try { pttSource?.disconnect(); } catch {}
-  try { pttStream?.getTracks().forEach((t) => t.stop()); } catch {}
-  try { pttCtx.close(); } catch {}
-  pttCtx = null;
-  pttStream = null;
-  pttSource = null;
-  pttProcessor = null;
-  await new Promise((r) => setTimeout(r, MIC_OFF_SETTLE_MS));
+  // ptt buffer is reset on the next openPtt's onReady (ptt.reset()).
 }
 
 // === Utterance flush =========================================================
@@ -611,7 +608,11 @@ orbDot.addEventListener("pointercancel", onOrbUp);
 // leave the context suspended and silently drop chime/TTS playback.
 function ensurePlayerCtx() {
   if (playerCtx) return;
-  playerCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+  // "playback" (larger output buffer) over "interactive": firefox android
+  // underruns the tiny interactive buffer on weak mobile cpus, crackling
+  // everything routed through this context (arp tones and tts alike). the
+  // extra output latency is harmless on the speaker side.
+  playerCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "playback" });
   // Diagnostic: surface state transitions so we can tell whether mobile
   // Firefox is moving the context to "interrupted" or "suspended" while
   // we sit idle in listening. Logged to #eventlog (visible on device).
@@ -655,6 +656,13 @@ async function initMic() {
     throw new Error("vad-web library not loaded");
   }
   setStatus("initializing");
+  // Resolves when VAD emits its very first processed frame — proves the
+  // worklet is actually pulling audio, not just hooked up. The open
+  // chime is gated on this so the user can't speak before VAD is truly
+  // listening.
+  let firstFrame;
+  const firstFrameReady = new Promise((r) => { firstFrame = r; });
+  let firstFrameSeen = false;
   micVad = await window.vad.MicVAD.new({
     audioContext: playerCtx,
     model: "v5",
@@ -671,37 +679,40 @@ async function initMic() {
     minSpeechFrames: 16,
     redemptionFrames: 6,
     preSpeechPadFrames: 3,
-    // pendingOpen gates VAD events during the open chime — mirrors the
-    // PTT processor's pendingOpen gate. Without it, a VAD speech-start
-    // during the chime would transition the phase out from under the
-    // open lifecycle.
+    // captureOpen gates all VAD-side events. False outside the open
+    // chime → close action window; true only when frames legitimately
+    // belong to an active utterance. Mirrors the PTT processor gate.
     onFrameProcessed: (_probs, frame) => {
-      if (state.vadSpeaking) vadBuffer.push(new Float32Array(frame));
+      if (!firstFrameSeen) { firstFrameSeen = true; firstFrame(); }
+      if (captureOpen && state.vadSpeaking) vadBuffer.push(new Float32Array(frame));
     },
     onSpeechStart: () => {
-      if (!ws || ws.readyState !== 1 || state.pendingOpen) return;
+      if (!ws || ws.readyState !== 1 || !captureOpen) return;
       vadBuffer = [];
       vadEndAudio = null;
       dispatch({ type: "VAD_SPEECH_START" });
     },
     onSpeechEnd: (audio) => {
-      if (!ws || ws.readyState !== 1 || state.pendingOpen) return;
+      if (!ws || ws.readyState !== 1 || !captureOpen) return;
       vadEndAudio = audio;
       dispatch({ type: "VAD_SPEECH_END" });
     },
     onVADMisfire: () => {
-      if (!ws || ws.readyState !== 1 || state.pendingOpen) return;
+      if (!ws || ws.readyState !== 1 || !captureOpen) return;
       vadBuffer = [];
       vadEndAudio = null;
       dispatch({ type: "VAD_MISFIRE" });
     },
   });
   await micVad.start();
+  await firstFrameReady;
 }
 
+// First-call only: bring up the VAD + mic track. Subsequent calls are
+// no-ops because we never pause the VAD — frame consumption is gated
+// by `captureOpen`, not by the mic being on/off.
 async function ensureLiveMic() {
   if (!micVad) await initMic();
-  else await micVad.start();
 }
 
 let pttCtx = null;
@@ -712,48 +723,26 @@ const ptt = createPtt({
   sendUtterance: (f32) => sendUtterance(f32),
 });
 
+// First-call only: bring up the PTT capture context + mic track. Kept
+// alive for the rest of the page lifetime; frame consumption is gated
+// by `captureOpen` so no concurrent-release race exists.
 async function ensurePttMic() {
   if (pttCtx) return;
-  // Race-safety: a quick RELEASE during the getUserMedia await can fire
-  // releasePttMic() concurrently, nulling pttCtx before our stream
-  // resolves. Keep a local handle and check it's still ours after each
-  // await — if not, clean up the mic we just acquired and bail.
-  const myCtx = new (window.AudioContext || window.webkitAudioContext)({
+  pttCtx = new (window.AudioContext || window.webkitAudioContext)({
     sampleRate: TARGET_CAPTURE_RATE,
   });
-  pttCtx = myCtx;
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1,
-      },
-    });
-  } catch (e) {
-    if (pttCtx === myCtx) {
-      try { myCtx.close(); } catch {}
-      pttCtx = null;
-    }
-    throw e;
-  }
-  if (pttCtx !== myCtx) {
-    // Released during getUserMedia — drop the freshly-acquired mic.
-    try { stream.getTracks().forEach((t) => t.stop()); } catch {}
-    try { myCtx.close(); } catch {}
-    return;
-  }
-  pttStream = stream;
+  pttStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+  });
   pttSource = pttCtx.createMediaStreamSource(pttStream);
   pttProcessor = pttCtx.createScriptProcessor(2048, 1, 1);
   pttProcessor.onaudioprocess = (e) => {
-    // pendingOpen gates capture during the open chime (mic hardware is
-    // hot but we haven't opened the gate yet). pttHeld stops capture as
-    // soon as the user releases — RELEASE clears it synchronously in
-    // the reducer, before CLOSE_PTT runs.
-    if (!state.pttHeld || state.pendingOpen) return;
+    if (!captureOpen) return;
     ptt.push(new Float32Array(e.inputBuffer.getChannelData(0)));
   };
   pttSource.connect(pttProcessor);
@@ -971,8 +960,9 @@ function switchSession(id) {
     ws = null;
     try { old.close(); } catch {}
   }
-  // pause mic/VAD and reset audio setup so the new session starts paused
-  if (micVad) { try { micVad.pause(); } catch {} }
+  // mic track stays hot across session switches — captureOpen gates
+  // any frames produced before the user opens the new session.
+  captureOpen = false;
   started = false;
   // reset client-side UI state
   setActiveSessionId(id);

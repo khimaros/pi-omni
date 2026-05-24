@@ -1,6 +1,6 @@
 {
   "name": "@khimaros/pi-omni",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "realtime voice chat with pi.dev",
   "keywords": [
     "pi-package"

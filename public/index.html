@@ -115,25 +115,23 @@
     transition: background 200ms ease-out;
   }
   /* Active (mic open — live or PTT): light up the bars in the same blue
-     used for the listening glow. Hover always toggles to the *other*
-     state, so the affordance is meaningful in both directions: hovering
-     an idle orb → blue (you're about to enable); hovering an active orb
-     → dim (you're about to mute). Hover is scoped to .dot so the effect
-     only fires inside the visible disc — #orb is flex:1 and otherwise
-     would trigger from anywhere in the layout column. Hover toggles are
-     gated by (hover: hover) so touch devices don't get a sticky :hover
-     after a tap, which would invert the displayed state. */
+     used for the listening glow. The glyph now reflects only the
+     active/paused state and is unaffected by hover; hover affordance
+     is conveyed by a thin ring around the orb (see the .dot:hover
+     rule below). */
   body.mic-on .orb-glyph-css .glyph .g-wave i {
     background: var(--user);
   }
+  /* Hover affordance: a thin white outline around the orb. Scoped to
+     .dot so it only fires inside the visible disc — #orb is flex:1
+     and otherwise would trigger from anywhere in the layout column.
+     Gated by (hover: hover) so touch devices don't get a sticky :hover
+     after a tap. */
   @media (hover: hover) and (pointer: fine) {
-    body:not(.mic-on) #orb .dot:hover .glyph .g-wave i,
-    body:not(.mic-on) #start-orb:not(.disabled) .dot:hover .glyph .g-wave i {
-      background: var(--user);
-    }
-    body.mic-on #orb .dot:hover .glyph .g-wave i,
-    body.mic-on #start-orb:not(.disabled) .dot:hover .glyph .g-wave i {
-      background: var(--dim);
+    #orb:not(.disabled) .dot:hover,
+    #start-orb:not(.disabled) .dot:hover {
+      outline: 1px solid rgba(255, 255, 255, 0.7);
+      outline-offset: 0;
     }
   }
   .orb-glyph-css .glyph .g-wave i:nth-child(1),
@@ -242,17 +240,20 @@
   /* Keep layout intact when hidden — the orb is flex:1 and would
      re-center if this element collapsed. */
   #start-hint.hidden { visibility: hidden; }
-  /* Debug event-log overlay. Hidden until body.debug is set (toggle by
-     pressing 'l' in the page or appending ?debug=1 to the URL). */
-  #eventlog {
-    display: none; position: fixed; left: 0; right: 0; bottom: 0;
-    max-height: 40vh; overflow: auto; margin: 0; padding: 6px 8px;
-    font: 10px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: #cbd5e1; background: rgba(15, 23, 42, 0.92);
-    border-top: 1px solid rgba(148, 163, 184, 0.25); white-space: pre;
-    pointer-events: none; user-select: text;
+  /* Debug copy-log button. Shown only when the page is loaded with
+     ?debug=1. Tapping copies the in-memory event log to the clipboard. */
+  #debug-copy {
+    display: none; position: fixed;
+    top: max(env(safe-area-inset-top), 16px); left: 16px;
+    z-index: 100;
+    background: none; border: none; color: var(--dim);
+    font-size: 13px; cursor: pointer; padding: 4px 8px;
+    transition: color 150ms ease;
   }
-  body.debug #eventlog { display: block; pointer-events: auto; }
+  #debug-copy:hover { color: var(--fg); }
+  body.debug #debug-copy { display: block; }
+  #debug-copy.copied { color: #4ade80; }
+  #debug-copy.failed { color: #f87171; }
 
   /* Sessions UI */
   #session-manager-ui {
@@ -408,8 +409,18 @@
   <div id="orb" class="disabled orb-glyph-css glyph-wave"><div class="dot"><span class="glyph"><span class="g g-play"></span><span class="g g-wave"><i></i><i></i><i></i><i></i><i></i></span><span class="g g-pause"><i></i><i></i></span><span class="g g-square"></span></span></div></div>
   <div id="transcript"></div>
   <div id="assistant"></div>
-  <p id="start-hint"></p>
-  <pre id="eventlog"></pre>
+  <p id="start-hint">push to talk or tap to toggle voice detection</p>
+  <button id="debug-copy" type="button" title="copy event log to clipboard" aria-label="copy event log">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: block;">
+      <path d="M8 2l1.5 2.5h5L16 2"></path>
+      <rect x="6" y="6" width="12" height="14" rx="6"></rect>
+      <line x1="12" y1="10" x2="12" y2="20"></line>
+      <line x1="3" y1="9" x2="6" y2="11"></line>
+      <line x1="21" y1="9" x2="18" y2="11"></line>
+      <line x1="3" y1="17" x2="6" y2="15"></line>
+      <line x1="21" y1="17" x2="18" y2="15"></line>
+    </svg>
+  </button>
   <script src="/vendor/ort/ort.min.js"></script>
   <script src="/vendor/vad-web/bundle.min.js"></script>
   <script type="module" src="app.js"></script>

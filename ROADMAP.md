@@ -4,6 +4,12 @@
 
 ```
 
+[x] keep mic track alive permanently after first acquire; gate utterance
+    frames so capture begins exactly when start chime ends and stops
+    immediately before end chime begins. eliminates os-level audio-session
+    renegotiation and the fragile mic-on settle delay.
+[x] fix crackling audio on firefox android (playerCtx output underruns):
+    use latencyHint "playback" for a larger output buffer
 [ ] PTT during live mode should barge in and return to paused after
 [ ] rename paused to something better, like idle?
 [ ] animate waveform when recording or something?

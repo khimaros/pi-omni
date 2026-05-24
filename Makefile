@@ -1,6 +1,8 @@
 TS_SOURCES        := $(shell find src test -name '*.ts' 2>/dev/null)
 
-.PHONY: build lint test precommit install update pack publish wasm clean
+.PHONY: build lint test precommit install update pack publish wasm clean adb-reverse adb-unreverse
+
+PORT ?= 4962
 
 .DEFAULT_GOAL := build
 
@@ -41,3 +43,15 @@ wasm:
 
 clean:
 	@rm -rf dist build
+
+# forward usb-tethered android phone's localhost:PORT to laptop's
+# localhost:PORT, so the phone browser can hit the dev server as
+# http://localhost:PORT and pass web audio's secure-context check.
+# requires usb debugging enabled on the phone and adb on the laptop.
+adb-reverse:
+	@adb reverse tcp:$(PORT) tcp:$(PORT)
+	@echo "==> phone http://localhost:$(PORT) → laptop localhost:$(PORT)"
+
+adb-unreverse:
+	@adb reverse --remove tcp:$(PORT)
+	@echo "==> removed phone reverse-forward for port $(PORT)"
