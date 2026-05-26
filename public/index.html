@@ -32,6 +32,9 @@
     --thinking: #fde68a;
     --synthesizing: #a5f3fc;
     --error: #fda4af;
+    /* vertical center of the pinned orb. above 50% to leave the lower
+       half for the prompt/reply readout; the top status is a single line. */
+    --orb-y: 36%;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -57,7 +60,14 @@
     flex: 1;
     display: flex; align-items: center; justify-content: center;
   }
+  /* Pin the disc to the viewport center so its position never depends on
+     how much history text loads into #transcript/#assistant below it.
+     #orb stays flex:1 as an in-flow spacer that keeps that content in the
+     lower region. */
   #orb .dot {
+    position: fixed;
+    top: var(--orb-y); left: 50%;
+    transform: translate(-50%, -50%);
     width: 140px; height: 140px;
     border-radius: 50%;
     display: flex; align-items: center; justify-content: center;

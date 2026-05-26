@@ -114,3 +114,33 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
 }
 
 registerProcessor("pcm-player", PcmPlayerProcessor);
+
+// Raw mono PCM capture for push-to-talk. Accumulates input quanta into
+// CAPTURE_CHUNK_SAMPLES-sized chunks and posts them to the main thread.
+// Unlike a ScriptProcessorNode, a capture worklet is pulled purely off its
+// input connection and needs no wiring to destination — so it opens no
+// second output stream, which on mobile destabilizes the playback context
+// and crackles TTS.
+const CAPTURE_CHUNK_SAMPLES = 2048;
+class PcmCaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buf = new Float32Array(CAPTURE_CHUNK_SAMPLES);
+    this.fill = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this.buf[this.fill++] = ch[i];
+      if (this.fill === CAPTURE_CHUNK_SAMPLES) {
+        this.port.postMessage(this.buf);
+        this.buf = new Float32Array(CAPTURE_CHUNK_SAMPLES);
+        this.fill = 0;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor("pcm-capture", PcmCaptureProcessor);

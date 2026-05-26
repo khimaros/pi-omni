@@ -15,6 +15,20 @@
     thinking): on socket reopen the reconnecting class clears but the stale
     "reconnecting" text lingered, painted by the leftover phase class.
     re-derive status text from phase when leaving the reconnecting state.
+[x] fix pre-live speech leaking into the first transcript: drop a VAD
+    onSpeechEnd whose onSpeechStart was gated out (vadSpeaking still false),
+    since the library's audio spans the pre-captureOpen portion.
+[x] keep ws alive during long "thinking" turns with a server-side ping/pong
+    heartbeat so idle mobile/proxy timeouts stop forcing a reconnect.
+[x] fix orb bouncing on refresh: it was the sole flex spacer, so history
+    text loading into transcript/assistant after first paint shrank its
+    region and shoved it up. pin the visible disc to viewport center so
+    its position no longer depends on sibling content height.
+[x] fix PTT audio crackling: PTT captured via a ScriptProcessorNode wired
+    to pttCtx.destination, opening a second 16khz output stream alongside
+    the 48khz playerCtx that never tore down — destabilizing TTS playback
+    on mobile after the first PTT press. capture via an AudioWorkletNode
+    not connected to destination (mirrors the live VAD worklet path).
 [ ] PTT during live mode should barge in and return to paused after
 [ ] rename paused to something better, like idle?
 [ ] animate waveform when recording or something?

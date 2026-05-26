@@ -15,6 +15,12 @@ const __dirname = dirname(__filename);
 const CLIENT_DIR = resolve(__dirname, "..", "..", "public");
 const PKG_VERSION: string = require(resolve(__dirname, "..", "..", "package.json")).version;
 
+// Ping each ws this often to keep idle connections alive through a long
+// "thinking" turn — mobile radios and intermediaries reap silent sockets
+// well under a minute. Browsers auto-reply with a pong at the protocol
+// level; a client that misses two consecutive pings is treated as dead.
+const WS_HEARTBEAT_MS = 25_000;
+
 // Resolve a dep's on-disk root by resolving its main entry and walking up to
 // the nearest package.json. Avoids `<pkg>/package.json` import which is gated
 // by some packages' `exports` field (e.g. onnxruntime-web). Works whether the
@@ -149,7 +155,18 @@ export async function startWebServer(opts: WebServerOptions): Promise<RunningSer
           opts.logger(`ws: created new session ${session.sessionId}`, "info");
         }
 
+        // Heartbeat: keep the socket warm during long turns and detect a
+        // peer that has silently gone away. `alive` is reset by each pong.
+        let alive = true;
+        ws.on("pong", () => { alive = true; });
+        const heartbeat = setInterval(() => {
+          if (!alive) { try { ws.terminate(); } catch {} return; }
+          alive = false;
+          try { ws.ping(); } catch {}
+        }, WS_HEARTBEAT_MS);
+
         ws.on("close", () => {
+          clearInterval(heartbeat);
           if (session.socket !== ws) {
             // Old socket that closed after re-attach. Ignore it.
             return;

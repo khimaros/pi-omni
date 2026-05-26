@@ -698,6 +698,11 @@ async function initMic() {
     },
     onSpeechEnd: (audio) => {
       if (!ws || ws.readyState !== 1 || !captureOpen) return;
+      // Drop a speech segment whose start we never accepted: if it began
+      // before captureOpen (e.g. talking as you tap "live"), onSpeechStart
+      // was gated out, but the library's `audio` still spans the pre-live
+      // portion. Without this guard that pre-live speech gets transcribed.
+      if (!state.vadSpeaking) return;
       vadEndAudio = audio;
       dispatch({ type: "VAD_SPEECH_END" });
     },
@@ -722,7 +727,7 @@ async function ensureLiveMic() {
 let pttCtx = null;
 let pttStream = null;
 let pttSource = null;
-let pttProcessor = null;
+let pttNode = null;
 const ptt = createPtt({
   sendUtterance: (f32) => sendUtterance(f32),
 });
@@ -743,14 +748,14 @@ async function ensurePttMic() {
       channelCount: 1,
     },
   });
+  await pttCtx.audioWorklet.addModule("worklet.js");
   pttSource = pttCtx.createMediaStreamSource(pttStream);
-  pttProcessor = pttCtx.createScriptProcessor(2048, 1, 1);
-  pttProcessor.onaudioprocess = (e) => {
-    if (!captureOpen) return;
-    ptt.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-  };
-  pttSource.connect(pttProcessor);
-  pttProcessor.connect(pttCtx.destination);
+  pttNode = new AudioWorkletNode(pttCtx, "pcm-capture");
+  // captureOpen gates frames on the main thread, mirroring the live VAD
+  // path. The node is deliberately NOT connected to destination — see the
+  // pcm-capture comment in worklet.js.
+  pttNode.port.onmessage = (e) => { if (captureOpen) ptt.push(e.data); };
+  pttSource.connect(pttNode);
 }
 
 // === WebSocket ===============================================================
