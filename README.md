@@ -47,16 +47,12 @@ pi --omni-live       # continuous voice on launch
 pi --omni-web        # web server on launch
 ```
 
-run the web server standalone (no pi tui):
+run the web server standalone (no pi tui). pi-coding-agent is an optional peer
+(the pi tui already provides it), so install it alongside pi-omni for the
+standalone path:
 
 ```bash
-PI_VOICE_LLM_MODEL=qwen3-32b npx @khimaros/pi-omni
-```
-
-or install globally:
-
-```bash
-npm install -g @khimaros/pi-omni
+npm install -g @earendil-works/pi-coding-agent @khimaros/pi-omni
 PI_VOICE_LLM_MODEL=qwen3-32b pi-omni-web
 ```
 

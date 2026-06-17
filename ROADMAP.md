@@ -29,6 +29,12 @@
     the 48khz playerCtx that never tore down — destabilizing TTS playback
     on mobile after the first PTT press. capture via an AudioWorkletNode
     not connected to destination (mirrors the live VAD worklet path).
+[x] fix standalone pi-omni-web crash on global install: ERR_MODULE_NOT_FOUND
+    for 'chalk'. the persona vm installs pi-coding-agent globally, then
+    `npm -g install`s pi-omni, which nests its own pi-coding-agent copy; since
+    pi-omni ships bundleDependencies (file: wasm), npm's reify drops part of
+    that nested copy's transitive deps (chalk). mark the pi-coding-agent peer
+    optional so npm never nests it and the bin resolves the top-level copy.
 [ ] PTT during live mode should barge in and return to paused after
 [ ] rename paused to something better, like idle?
 [ ] animate waveform when recording or something?

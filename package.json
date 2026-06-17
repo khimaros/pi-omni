@@ -1,6 +1,6 @@
 {
   "name": "@khimaros/pi-omni",
-  "version": "0.20.0",
+  "version": "0.20.1",
   "description": "realtime voice chat with pi.dev",
   "keywords": [
     "pi-package"
@@ -23,7 +23,9 @@
     "pi-omni-web": "dist/bin/pi-omni-web.js"
   },
   "pi": {
-    "extensions": ["dist/extension/index.js"]
+    "extensions": [
+      "dist/extension/index.js"
+    ]
   },
   "files": [
     "dist",
@@ -45,9 +47,16 @@
     "node": ">=20"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0"
+    "@earendil-works/pi-coding-agent": "^0.79.6"
   },
-  "bundleDependencies": ["pi-omni-apm"],
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "bundleDependencies": [
+    "pi-omni-apm"
+  ],
   "dependencies": {
     "@ricky0123/vad-web": "^0.0.30",
     "avr-vad": "^1.0.10",
@@ -57,9 +66,15 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.79.6",
     "@types/node": "^20.11.0",
     "@types/ws": "^8.18.1",
     "typescript": "^5.4.0"
+  },
+  "allowScripts": {
+    "onnxruntime-node@1.26.0": true,
+    "protobufjs@7.6.4": true,
+    "protobufjs@7.5.9": true,
+    "@google/genai@1.52.0": true
   }
 }
