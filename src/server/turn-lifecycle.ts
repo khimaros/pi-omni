@@ -1,4 +1,4 @@
-// Tracks whether the server is currently within a "live" turn — i.e.
+// Tracks whether the server is currently within a "live" turn -- i.e.
 // the runtime is producing events the client should see. WebSession
 // uses isActive to gate llm_delta / tts / agent_end forwarding.
 //
@@ -13,7 +13,7 @@
 // stale end to be consumed before rearm. Two design constraints fall
 // out of that:
 //
-//   1. rearm() decays one pending stale end — by the time the next
+//   1. rearm() decays one pending stale end -- by the time the next
 //      prompt() runs, we assume any stale drain has either fired
 //      (consumed it) or has been effectively lost. A late drained
 //      agent_end firing AFTER rearm gets forwarded as "natural"; the
@@ -30,7 +30,7 @@
 //   "natural":   no pending stale; treat as forwardable.
 //   "cancelled": there was a pending stale; consume and suppress.
 //   "idle":      called while nothing is active and no stales pending
-//                — ignore.
+//                -- ignore.
 export type EndKind = "natural" | "cancelled" | "idle";
 
 export class TurnLifecycle {
@@ -61,12 +61,12 @@ export class TurnLifecycle {
 
   rearm(): void {
     // Re-assert active so the new turn's events forward, AND decay one
-    // pending stale — we've waited as long as we're going to wait for
+    // pending stale -- we've waited as long as we're going to wait for
     // the drained end to arrive. If it fired during abort, end() has
     // already consumed it (pending was already 0). If it didn't, we
     // forfeit suppression: a late drained agent_end will classify as
     // natural and be forwarded, but the frontend workaround handles
-    // that path gracefully. The alternative — keeping pending — was
+    // that path gracefully. The alternative -- keeping pending -- was
     // worse: the new turn's REAL natural end would then misclassify
     // as cancelled and the UI would stick in "thinking" forever.
     this.active = true;
@@ -92,7 +92,7 @@ export class TurnLifecycle {
     if (this.active) {
       // Do NOT clear active here. Subsequent events for this same
       // turn (or even a late drained event from a prior turn) must
-      // continue flowing — the only path to active=false is begin()
+      // continue flowing -- the only path to active=false is begin()
       // replacing an active turn at the next utterance.
       return "natural";
     }

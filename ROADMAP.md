@@ -26,10 +26,10 @@
     its position no longer depends on sibling content height.
 [x] fix PTT audio crackling: PTT captured via a ScriptProcessorNode wired
     to pttCtx.destination, opening a second 16khz output stream alongside
-    the 48khz playerCtx that never tore down — destabilizing TTS playback
+    the 48khz playerCtx that never tore down -- destabilizing TTS playback
     on mobile after the first PTT press. capture via an AudioWorkletNode
     not connected to destination (mirrors the live VAD worklet path).
-[x] fix standalone pi-omni-web crash on global install: ERR_MODULE_NOT_FOUND
+[x] fix standalone pi-omni crash on global install: ERR_MODULE_NOT_FOUND
     for 'chalk'. the persona vm installs pi-coding-agent globally, then
     `npm -g install`s pi-omni, which nests its own pi-coding-agent copy; since
     pi-omni ships bundleDependencies (file: wasm), npm's reify drops part of
@@ -39,8 +39,8 @@
 [ ] rename paused to something better, like idle?
 [ ] animate waveform when recording or something?
 [ ] native Node binding to libwebrtc-audio-processing to drop the WASM layer
-[ ] whisper in the browser (whisper.cpp WASM / transformers.js) — keep only LLM on server
-[ ] TTS in the browser (Kokoro / Piper WASM) — eliminate audio round-trip
+[ ] whisper in the browser (whisper.cpp WASM / transformers.js) -- keep only LLM on server
+[ ] TTS in the browser (Kokoro / Piper WASM) -- eliminate audio round-trip
 [ ] smarter sentence chunking (abbreviation-aware: "e.g.", "i.e.", "Dr.", ...)
 ## done
 

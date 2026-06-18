@@ -1,10 +1,10 @@
 // PTT capture buffer. The interesting case is the action ordering
 // driven by state.js's RELEASE reducer: it returns
 // [CLOSE_PTT, WS_FLUSH_PTT, audio_end]. runAction in app.js dispatches
-// them in order — closePtt() starts the async close lifecycle, control
+// them in order -- closePtt() starts the async close lifecycle, control
 // returns, and WS_FLUSH_PTT calls flush() SYNCHRONOUSLY before the
 // lifecycle's awaits resolve. The lifecycle must observe flush()'s
-// hadAudio side-effect when it eventually dispatches CLOSE_DONE —
+// hadAudio side-effect when it eventually dispatches CLOSE_DONE --
 // otherwise the phase stays stuck at "paused" instead of advancing to
 // "transcribing". consumeHadAudio() is the read-and-clear primitive
 // the lifecycle uses to make that observation late.

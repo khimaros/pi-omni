@@ -51,7 +51,7 @@ export function sanitizeForSpeech(input: string): string {
   // HTML tags.
   s = s.replace(/<[^>]+>/g, "");
 
-  // Collapse newlines + whitespace — TTS reads as a continuous stream.
+  // Collapse newlines + whitespace -- TTS reads as a continuous stream.
   s = s.replace(/\s+/g, " ");
 
   return s.trim();

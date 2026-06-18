@@ -194,17 +194,17 @@ let arp = null;
 // Single source of truth for "frames count toward an utterance right now".
 // Flipped to true synchronously after the open chime resolves, and back
 // to false synchronously when a CLOSE_LIVE / CLOSE_PTT / RELEASE_MIC
-// action handler runs — strictly BEFORE the close chime is scheduled or
+// action handler runs -- strictly BEFORE the close chime is scheduled or
 // any flush action reads its buffer. Frame-producing paths (PTT
 // processor, VAD callbacks) consult only this flag, never tear the mic
 // hardware down between sessions, so the OS audio-session route stays in
-// record+play permanently after the first acquire — chimes hit a stable
+// record+play permanently after the first acquire -- chimes hit a stable
 // route every time and need no timing fudge factor.
 let captureOpen = false;
 // Parallel buffer of VAD-processed frames during a speech segment, used
 // for mid-utterance flush when the user pauses live mid-sentence.
 let vadBuffer = [];
-// Complete utterance handed to us by the VAD library on onSpeechEnd —
+// Complete utterance handed to us by the VAD library on onSpeechEnd --
 // preferred over vadBuffer in the natural-end case (no leading-consonant clip).
 let vadEndAudio = null;
 let prefetchDone = false;
@@ -234,7 +234,7 @@ function updateProgress() {
       document.body.classList.add("error");
       return;
     }
-    // Hand the status line back to the reducer — it'll be repainted to
+    // Hand the status line back to the reducer -- it'll be repainted to
     // the current phase on the next phase change. Set the resting text
     // explicitly here since no phase change fires at prefetch completion.
     setStatus(state.phase);
@@ -255,8 +255,8 @@ async function prefetchOne(i) {
     // firefox android, reading a *cached* response body can hang forever
     // (neither resolves nor rejects), which strands the UI at
     // "downloading" on every soft refresh. A hang only happens when the
-    // resource is already cached — i.e. the cache is already warm and we
-    // don't actually need the body — so race the read against a timeout
+    // resource is already cached -- i.e. the cache is already warm and we
+    // don't actually need the body -- so race the read against a timeout
     // and treat the timeout as success. The fetch is left running so a
     // genuine first-load download still completes and populates the cache.
     const resp = await fetch(url, { cache: "force-cache" });
@@ -278,7 +278,7 @@ async function prefetchOne(i) {
 if (!window.isSecureContext) {
   console.error("[start] insecure origin:", location.origin);
   startHint.textContent =
-    `insecure origin (${location.origin}) — needs HTTPS or localhost. ` +
+    `insecure origin (${location.origin}) -- needs HTTPS or localhost. ` +
     `Tunnel: ssh -L ${location.port}:localhost:${location.port} <host>`;
   document.body.classList.add("error");
 } else {
@@ -312,7 +312,7 @@ async function playChime(reverse) {
   const noteDur = 0.16;
   const stagger = 0.09;
   // leadSec sits well above the audio thread's quantum so the t0 ramp
-  // never lands in the past — if it did, the 0→peak attack would
+  // never lands in the past -- if it did, the 0→peak attack would
   // collapse and the note would start at full gain (or skip entirely).
   // The audio engine itself is kept awake by the keepalive oscillator
   // wired up at start(), so we don't need a per-chime warmup anymore.
@@ -435,7 +435,7 @@ class Arpeggiator {
 //
 // OPEN_DONE fires BEFORE the start chime so the orb visually transitions
 // into the active phase (listening / recording) while the chime is
-// playing — the chime confirms the transition rather than preceding it.
+// playing -- the chime confirms the transition rather than preceding it.
 // Capture still doesn't begin until the chime resolves, gated by
 // `captureOpen` flipping at the very end.
 //
@@ -456,7 +456,7 @@ async function openMicLifecycle({ sessionMode, prepare, acquire, onReady }) {
     if (state.sessionMode !== sessionMode) return;
     // First-call only: acquire the mic hardware. Subsequent opens are
     // no-ops because the track is kept alive for the lifetime of the
-    // page — see the comment on `captureOpen` for the rationale.
+    // page -- see the comment on `captureOpen` for the rationale.
     await acquire();
     if (state.sessionMode !== sessionMode) return;
     dispatch({ type: "OPEN_DONE", kind: sessionMode });
@@ -505,7 +505,7 @@ async function closeLive() {
 async function closePtt() {
   // getHadAudio is read AFTER the chime/release awaits resolve, so it
   // observes the post-flush value. flush() runs synchronously between
-  // CLOSE_PTT and audio_end in the RELEASE reducer's action list — by
+  // CLOSE_PTT and audio_end in the RELEASE reducer's action list -- by
   // the time closeMicLifecycle's first await yields, flush has already
   // populated hadAudio.
   return closeMicLifecycle({
@@ -629,7 +629,7 @@ function ensurePlayerCtx() {
 async function start() {
   if (!window.isSecureContext) {
     throw new Error(
-      `insecure origin (${location.origin}) — pi-omni-web needs HTTPS or ` +
+      `insecure origin (${location.origin}) -- pi-omni needs HTTPS or ` +
       `localhost. Tunnel with: ssh -L ${location.port}:localhost:${location.port} <host>`,
     );
   }
@@ -656,7 +656,7 @@ async function initMic() {
     throw new Error("vad-web library not loaded");
   }
   setStatus("initializing");
-  // Resolves when VAD emits its very first processed frame — proves the
+  // Resolves when VAD emits its very first processed frame -- proves the
   // worklet is actually pulling audio, not just hooked up. The open
   // chime is gated on this so the user can't speak before VAD is truly
   // listening.
@@ -666,7 +666,7 @@ async function initMic() {
   // Let MicVAD own its capture AudioContext. Sharing playerCtx put a mic
   // input on the playback context, which forces mobile browsers into
   // voice-communication mode (lower rate, tiny buffers, output AEC) and
-  // makes everything routed through it choppy — the arp worst of all,
+  // makes everything routed through it choppy -- the arp worst of all,
   // since its multi-node envelopes underrun before the cheap pcm copy.
   micVad = await window.vad.MicVAD.new({
     model: "v5",
@@ -718,7 +718,7 @@ async function initMic() {
 }
 
 // First-call only: bring up the VAD + mic track. Subsequent calls are
-// no-ops because we never pause the VAD — frame consumption is gated
+// no-ops because we never pause the VAD -- frame consumption is gated
 // by `captureOpen`, not by the mic being on/off.
 async function ensureLiveMic() {
   if (!micVad) await initMic();
@@ -752,7 +752,7 @@ async function ensurePttMic() {
   pttSource = pttCtx.createMediaStreamSource(pttStream);
   pttNode = new AudioWorkletNode(pttCtx, "pcm-capture");
   // captureOpen gates frames on the main thread, mirroring the live VAD
-  // path. The node is deliberately NOT connected to destination — see the
+  // path. The node is deliberately NOT connected to destination -- see the
   // pcm-capture comment in worklet.js.
   pttNode.port.onmessage = (e) => { if (captureOpen) ptt.push(e.data); };
   pttSource.connect(pttNode);
@@ -770,7 +770,7 @@ function resetSessionState() {
 async function initSession() {
   if (state.sessionMode === "live" && !micVad) await initMic();
   // If reducer hasn't been told a phase yet (initial bring-up or post-reset),
-  // apply the resting phase. Otherwise leave alone — the session-mode
+  // apply the resting phase. Otherwise leave alone -- the session-mode
   // handler that triggered start() owns the phase.
   if (state.phase === "paused" && state.sessionMode !== "pause") {
     // Live or PTT triggered start; their OPEN_DONE will set phase.
@@ -795,7 +795,7 @@ function openWs(isReconnect = false) {
       // WS_OPEN doesn't move phase, so applyState won't refresh the status
       // text. Without this, resetSessionState()'s stale "reconnecting" text
       // survives the reopen and gets painted in the lingering phase color
-      // (e.g. thinking amber) — a yellow "reconnecting".
+      // (e.g. thinking amber) -- a yellow "reconnecting".
       if (wasReconnecting) setStatus(state.phase);
       settled = true;
       resolve();
@@ -975,7 +975,7 @@ function switchSession(id) {
     ws = null;
     try { old.close(); } catch {}
   }
-  // mic track stays hot across session switches — captureOpen gates
+  // mic track stays hot across session switches -- captureOpen gates
   // any frames produced before the user opens the new session.
   captureOpen = false;
   started = false;
@@ -992,7 +992,7 @@ function switchSession(id) {
   setBodyState("reconnecting", false);
   dispatch({ type: "WS_CLOSE" });
   renderSessionsUI();
-  // open fresh connection — server assigns a new session when id is empty
+  // open fresh connection -- server assigns a new session when id is empty
   openWs(false).catch(() => scheduleReconnect());
 }
 

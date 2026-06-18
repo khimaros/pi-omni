@@ -8,7 +8,7 @@
 //   { kind: "tool_result", name: "<tool>", ok: true|false }
 //
 // Anything else falls back to the kind itself (or the generic "event"
-// when even that's missing) — keeps the UI from blanking out on a
+// when even that's missing) -- keeps the UI from blanking out on a
 // future server-side extension we haven't taught the client about yet.
 export function formatComponent(c) {
   if (!c || typeof c !== "object") return "event";
@@ -28,14 +28,14 @@ export function formatComponent(c) {
 // Pure reducer for the contents of the assistant slot. The slot shows
 // AT MOST ONE indicator chip (the most recent component for the turn)
 // alongside the streaming answer text. Once any text streams, the chip
-// is dropped — the durable answer supersedes in-progress meta. The
+// is dropped -- the durable answer supersedes in-progress meta. The
 // driver renders {chip, text} after each event.
 export const initialAssistant = Object.freeze({ chip: null, text: "" });
 
 export function reduceAssistant(state, event) {
   switch (event?.type) {
     case "component":
-      // Late components (after answer text has begun) are ignored — the
+      // Late components (after answer text has begun) are ignored -- the
       // answer is the durable display, chips are pre-answer activity
       // only.
       if (state.text) return state;

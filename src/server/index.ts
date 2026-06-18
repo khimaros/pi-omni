@@ -1,282 +1,457 @@
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFile, stat } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, extname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { WebSocketServer, type WebSocket } from "ws";
-import type { WebSession } from "./session.js";
+#!/usr/bin/env node
+// standalone pi-omni web voice server. boots the HTTP/WS server, spawns a
+// pi-coding-agent session per connection (so the LLM, tools, and any installed
+// pi extensions are in the loop), and announces its url on stdout as
+// `base_url=http://host:port`. the pi extension spawns this; it can also be run
+// directly. the OpenAI-compatible endpoint from cfg is used for STT and TTS only.
+// compiled to dist/ by tsc; the published bin is plain js.
 
-const require = createRequire(import.meta.url);
+import { join, resolve } from "node:path";
+import { readdirSync } from "node:fs";
+import OpenAI from "openai";
+import {
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  getAgentDir,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+import { loadConfig, DEFAULT_HOST, DEFAULT_PORT, LISTEN_ENV } from "../config.js";
+import { startWebServer } from "./http.js";
+import { WebSession } from "./session.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-// At runtime we're under dist/server/, so browser assets are at <pkg>/public/.
-const CLIENT_DIR = resolve(__dirname, "..", "..", "public");
-const PKG_VERSION: string = require(resolve(__dirname, "..", "..", "package.json")).version;
+type Listen = { host?: string; port?: number };
 
-// Ping each ws this often to keep idle connections alive through a long
-// "thinking" turn — mobile radios and intermediaries reap silent sockets
-// well under a minute. Browsers auto-reply with a pong at the protocol
-// level; a client that misses two consecutive pings is treated as dead.
-const WS_HEARTBEAT_MS = 25_000;
-
-// Resolve a dep's on-disk root by resolving its main entry and walking up to
-// the nearest package.json. Avoids `<pkg>/package.json` import which is gated
-// by some packages' `exports` field (e.g. onnxruntime-web). Works whether the
-// dep is colocated (dev) or hoisted (global install).
-function resolvePackageDir(spec: string): string {
-  const mainPath = require.resolve(spec);
-  let dir = dirname(mainPath);
-  while (true) {
-    if (existsSync(join(dir, "package.json"))) return dir;
-    const parent = dirname(dir);
-    if (parent === dir) throw new Error(`package.json not found for ${spec}`);
-    dir = parent;
-  }
+// parse a "host:port" / ":port" / "port" / "[ipv6]:port" spec; missing parts
+// stay undefined so callers can layer their own fallbacks.
+function parseListen(spec: string | undefined): Listen {
+  const m = (spec ?? "").match(/^(?:\[([^\]]+)\]|([^:]+))?:?(\d+)?$/);
+  if (!m) return {};
+  return { host: m[1] || m[2] || undefined, port: m[3] ? Number(m[3]) : undefined };
 }
 
-// Map URL path prefix → resolved on-disk subdirectory of the dep package.
-const VENDOR_MAP: Array<{ prefix: string; baseDir: string }> = [
-  {
-    prefix: "/vendor/vad-web/",
-    baseDir: resolve(resolvePackageDir("@ricky0123/vad-web"), "dist"),
-  },
-  {
-    prefix: "/vendor/ort/",
-    baseDir: resolve(resolvePackageDir("onnxruntime-web"), "dist"),
-  },
-];
+function parseArgs(argv: string[]): Listen & { help?: boolean } {
+  const out: Listen & { help?: boolean } = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-h" || a === "--help") out.help = true;
+    else if (a === "--listen") Object.assign(out, parseListen(argv[++i]));
+    else if (a.startsWith("--listen=")) Object.assign(out, parseListen(a.slice("--listen=".length)));
+  }
+  return out;
+}
 
-const MIME: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".mjs": "application/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".webmanifest": "application/manifest+json; charset=utf-8",
-  ".wasm": "application/wasm",
-  ".onnx": "application/octet-stream",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-};
+const HELP = `pi-omni -- standalone web voice server
 
-export type WebServerOptions = {
-  host: string;
-  port: number;
-  // Factory invoked once per WS connection. The session takes ownership of
-  // the socket; on close it should release any pi-side resources. May be
-  // async — bootstrap (e.g. spinning up a per-connection pi runtime) runs
-  // before the WebSession is returned.
-  makeSession: (
-    ws: WebSocket,
-    logger: (m: string, l?: string) => void,
-    requestedSessionId?: string,
-  ) => WebSession | Promise<WebSession>;
-  logger: (m: string, l?: "info" | "warning" | "error") => void;
-};
+Usage: pi-omni [--listen <host:port>]
 
-export type RunningServer = {
-  http: Server;
-  wss: WebSocketServer;
-  url: string;
-  close: () => Promise<void>;
-};
+Reads config from ~/.pi/extensions/omni.json. Override the bind address with
+--listen or PI_OMNI_LISTEN. LLM/tools are handled by pi-coding-agent (and any
+installed extensions); the OpenAI-compatible endpoint is used for STT and TTS.
+`;
 
-export async function startWebServer(opts: WebServerOptions): Promise<RunningServer> {
-  const sessions = new Map<string, WebSession>();
-
-  // Surface where each vendor dep is being served from, and warn loudly if
-  // the dir is missing — the silent-fail mode is a disabled start button.
-  for (const v of VENDOR_MAP) {
-    const exists = await stat(v.baseDir).then((s) => s.isDirectory()).catch(() => false);
-    if (exists) {
-      opts.logger(`vendor ${v.prefix} → ${v.baseDir}`, "info");
-    } else {
-      opts.logger(
-        `vendor ${v.prefix} → ${v.baseDir} (MISSING — start button will stay disabled)`,
-        "error",
-      );
+// Mirrors pi-webui's selection: honor the user's /scoped-models setting when
+// resolving which models the session may use.
+function resolveScopedModelsFromSettings(services: any): Array<{ model: any }> {
+  const patterns = services.settingsManager.getEnabledModels?.();
+  if (!patterns || patterns.length === 0) return [];
+  const available = services.modelRegistry.getAvailable();
+  const matched: Array<{ model: any }> = [];
+  for (const pattern of patterns) {
+    const found = available.find(
+      (m: any) => `${m.provider}/${m.id}` === pattern || m.id === pattern,
+    );
+    if (found && !matched.find((sm) => sm.model === found)) {
+      matched.push({ model: found });
     }
   }
-
-  const http = createServer((req, res) => {
-    void handleHttp(req, res, (m, l) =>
-      opts.logger(m, (l as "info" | "warning" | "error" | undefined) ?? "info"),
-    );
-  });
-  const wss = new WebSocketServer({ noServer: true });
-
-  http.on("upgrade", (req, socket, head) => {
-    if (!req.url) return socket.destroy();
-    const url = new URL(req.url, "http://localhost");
-    if (url.pathname !== "/ws") return socket.destroy();
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      void (async () => {
-        const sessionId = url.searchParams.get("sessionId") || undefined;
-        let session: WebSession;
-
-        if (sessionId && sessions.has(sessionId)) {
-          session = sessions.get(sessionId)!;
-          try {
-            session.attach(ws);
-            opts.logger(`ws: re-attached to existing session ${sessionId}`, "info");
-          } catch (e) {
-            opts.logger(`ws: failed to re-attach to session ${sessionId}: ${(e as Error).message}`, "error");
-            try {
-              ws.close();
-            } catch {}
-            return;
-          }
-        } else {
-          try {
-            session = await opts.makeSession(
-              ws,
-              (m, l) => opts.logger(m, (l as "info" | "warning" | "error" | undefined) ?? "info"),
-              sessionId,
-            );
-          } catch (e) {
-            opts.logger(`makeSession failed: ${(e as Error).message}`, "error");
-            try {
-              ws.close();
-            } catch {}
-            return;
-          }
-
-          // The socket may have closed during async bootstrap; dispose now if so.
-          if (ws.readyState === ws.CLOSED || ws.readyState === ws.CLOSING) {
-            try {
-              session.dispose();
-            } catch {}
-            return;
-          }
-
-          sessions.set(session.sessionId, session);
-          opts.logger(`ws: created new session ${session.sessionId}`, "info");
-        }
-
-        // Heartbeat: keep the socket warm during long turns and detect a
-        // peer that has silently gone away. `alive` is reset by each pong.
-        let alive = true;
-        ws.on("pong", () => { alive = true; });
-        const heartbeat = setInterval(() => {
-          if (!alive) { try { ws.terminate(); } catch {} return; }
-          alive = false;
-          try { ws.ping(); } catch {}
-        }, WS_HEARTBEAT_MS);
-
-        ws.on("close", () => {
-          clearInterval(heartbeat);
-          if (session.socket !== ws) {
-            // Old socket that closed after re-attach. Ignore it.
-            return;
-          }
-          opts.logger(`ws: connection closed for session ${session.sessionId}, disposing immediately`, "info");
-          try {
-            session.dispose();
-          } catch {}
-          sessions.delete(session.sessionId);
-        });
-      })();
-    });
-  });
-
-  await new Promise<void>((res, rej) => {
-    http.once("error", rej);
-    http.listen(opts.port, opts.host, () => res());
-  });
-  const url = `http://${opts.host}:${opts.port}`;
-
-  return {
-    http,
-    wss,
-    url,
-    close: () =>
-      new Promise<void>((res) => {
-        for (const [sid, session] of sessions) {
-          try {
-            session.dispose();
-          } catch {}
-        }
-        sessions.clear();
-        for (const c of wss.clients) c.close();
-        wss.close(() => http.close(() => res()));
-      }),
-  };
+  return matched;
 }
 
-async function handleHttp(
-  req: IncomingMessage,
-  res: ServerResponse,
-  log: (m: string, l?: string) => void,
-): Promise<void> {
-  try {
-    if (!req.url) return notFound(res);
-    const url = new URL(req.url, "http://localhost");
-    const rawPath = url.pathname;
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help) {
+    process.stdout.write(HELP);
+    return;
+  }
 
-    // Vendor routes — serve specific node_modules paths. These rarely
-    // change, so we cache them aggressively.
-    for (const v of VENDOR_MAP) {
-      if (rawPath.startsWith(v.prefix)) {
-        const sub = rawPath.slice(v.prefix.length).replace(/\.\.+/g, "");
-        const filePath = join(v.baseDir, sub);
-        if (!filePath.startsWith(v.baseDir)) return notFound(res);
-        return await serveFile(res, filePath, "public, max-age=3600", log);
+  const { cfg } = await loadConfig();
+  // precedence: --listen flag, then PI_OMNI_LISTEN env, then the config file,
+  // then the defaults. all express a single host:port bind address.
+  const envListen = parseListen(process.env[LISTEN_ENV]);
+  const host = args.host ?? envListen.host ?? (cfg.webHost?.length ? cfg.webHost : DEFAULT_HOST);
+  const port = args.port ?? envListen.port ?? cfg.webPort ?? DEFAULT_PORT;
+
+  const log = (m: string, l?: "info" | "warning" | "error"): void => {
+    process.stderr.write(`[pi-omni] ${l ?? "info"}: ${m}\n`);
+  };
+
+  const cwd = process.env.PI_PROJECT_CWD
+    ? resolve(process.env.PI_PROJECT_CWD)
+    : process.cwd();
+  const agentDir = process.env.PI_AGENT_DIR || getAgentDir();
+  const sessionDir = process.env.PI_SESSION_DIR;
+
+  // STT/TTS endpoint client -- LLM is handled by pi-coding-agent below.
+  const sttTtsClient = new OpenAI({ baseURL: cfg.baseURL, apiKey: cfg.apiKey });
+
+  // Each browser session gets its own pi runtime/session: hitting refresh
+  // (or opening a second tab) yields a clean conversation, not a shared one.
+  // Trade-off: extensions re-init per connection -- slower first-utterance
+  // latency, but the only correct behavior when multiple users / tabs hit
+  // the same server.
+  function findSessionFile(sessionId: string, dir: string): string | undefined {
+    try {
+      const files = readdirSync(dir);
+      const suffix = `_${sessionId}.jsonl`;
+      const found = files.find((f) => f.endsWith(suffix));
+      if (found) {
+        return join(dir, found);
+      }
+    } catch {}
+    return undefined;
+  }
+
+  const createPiSessionForConnection = async (
+    connLog: (m: string, l?: "info" | "warning" | "error") => void,
+    requestedSessionId?: string,
+  ) => {
+    const defaultMgr = SessionManager.create(cwd, sessionDir);
+    const resolvedSessionDir = defaultMgr.getSessionDir();
+
+    let activeMgr = defaultMgr;
+    if (requestedSessionId) {
+      const file = findSessionFile(requestedSessionId, resolvedSessionDir);
+      if (file) {
+        connLog(`resuming existing pi session: ${requestedSessionId}`);
+        activeMgr = SessionManager.open(file, sessionDir);
+      } else {
+        connLog(`requested session ${requestedSessionId} not found, starting new`);
       }
     }
 
-    // Static client files — change every build, so disable caching.
-    let path = rawPath === "/" ? "/index.html" : rawPath;
-    path = path.replace(/^\/+/, "").replace(/\.\.+/g, "");
-    const filePath = join(CLIENT_DIR, path);
-    if (!filePath.startsWith(CLIENT_DIR)) return notFound(res, rawPath, log);
-    // sw.js carries the cache version — substitute __VERSION__ from package.json
-    // so a release bump invalidates the precache without a manual edit.
-    if (path === "sw.js") {
-      const src = await readFile(filePath, "utf8").catch(() => null);
-      if (src === null) return notFound(res, filePath, log);
-      const body = src.replace(/__VERSION__/g, PKG_VERSION);
-      res.writeHead(200, {
-        "Content-Type": MIME[".js"],
-        "Cache-Control": "no-store",
-      });
-      res.end(body);
-      return;
+    const runtime = await createAgentSessionRuntime(
+      async ({ cwd, sessionManager, sessionStartEvent }: any) => {
+        const services = await createAgentSessionServices({ cwd, agentDir });
+        const scopedModels = resolveScopedModelsFromSettings(services);
+        return {
+          ...(await createAgentSessionFromServices({
+            services,
+            sessionManager,
+            sessionStartEvent,
+            scopedModels,
+          })),
+          services,
+          diagnostics: services.diagnostics,
+        };
+      },
+      {
+        cwd,
+        agentDir,
+        sessionManager: activeMgr,
+      },
+    );
+    const session = runtime.session;
+    await session.bindExtensions({});
+    connLog(
+      `pi session ready: ${session.model ? `${session.model.provider}/${session.model.id}` : "(no model)"}`,
+    );
+
+    // Append the voice system prompt LAST, after every other extension has
+    // had a chance to mutate it. Mutating _baseSystemPrompt directly doesn't
+    // work because earlier-loaded extensions (pi-evolve, etc.) implement
+    // before_agent_start by REPLACING event.systemPrompt with their own
+    // merged value -- dropping anything we'd appended to the base. We wrap
+    // _extensionRunner.emitBeforeAgentStart so our append runs after the
+    // full handler chain. See pi-evolve/src/extension/index.ts for the
+    // standard before_agent_start "append to event.systemPrompt" pattern.
+    const voicePrompt = cfg.voiceSystemPrompt?.trim();
+    if (voicePrompt) {
+      const runner = (session as unknown as {
+        _extensionRunner: {
+          emitBeforeAgentStart: (
+            prompt: string,
+            images: unknown,
+            systemPrompt: string,
+            opts: unknown,
+          ) => Promise<
+            { messages?: unknown[]; systemPrompt?: string } | undefined
+          >;
+        };
+      })._extensionRunner;
+      const orig = runner.emitBeforeAgentStart.bind(runner);
+      runner.emitBeforeAgentStart = async (prompt, images, systemPrompt, opts) => {
+        const result = await orig(prompt, images, systemPrompt, opts);
+        const base = result?.systemPrompt ?? systemPrompt;
+        return {
+          messages: result?.messages,
+          systemPrompt: `${base}\n\n${voicePrompt}`,
+        };
+      };
+      connLog(`will append voice system prompt (${voicePrompt.length} chars) after extensions`);
     }
-    return await serveFile(res, filePath, "no-store", log);
-  } catch (e) {
-    log(`web: request error for ${req.url}: ${(e as Error).message}`, "warning");
-    notFound(res, req.url || "(unknown)", log);
-  }
-}
 
-async function serveFile(
-  res: ServerResponse,
-  filePath: string,
-  cacheControl: string,
-  log: (m: string, l?: string) => void,
-): Promise<void> {
-  const s = await stat(filePath).catch(() => null);
-  if (!s || !s.isFile()) {
-    // Treat any miss in a /vendor/ path as load-bearing: it's almost always a
-    // mis-resolved dep dir, which silently disables the start button.
-    const level = filePath.includes("/vendor/") || /\b(vad-web|onnxruntime-web)\b/.test(filePath)
-      ? "error" : "warning";
-    log(`asset miss: ${filePath}`, level);
-    return notFound(res, filePath, log);
-  }
-  const data = await readFile(filePath);
-  const mime = MIME[extname(filePath).toLowerCase()] ?? "application/octet-stream";
-  res.writeHead(200, {
-    "Content-Type": mime,
-    "Cache-Control": cacheControl,
+    try {
+      const active = (session as any).getActiveToolNames?.() ?? [];
+      const all = (session as any).getAllTools?.() ?? [];
+      connLog(`tools active=${active.length} total=${all.length}: ${active.join(", ") || "(none)"}`);
+    } catch (e) {
+      connLog(`could not list tools: ${(e as Error).message}`, "warning");
+    }
+    const diag = (runtime as any).diagnostics ?? [];
+    if (Array.isArray(diag) && diag.length > 0) {
+      for (const d of diag) {
+        const type = d?.type ?? "info";
+        const lvl: "info" | "warning" | "error" =
+          type === "error" ? "error" : type === "warning" ? "warning" : "info";
+        connLog(`diag(${type}): ${d?.message ?? JSON.stringify(d)} ${d?.path ?? ""}`, lvl);
+      }
+    }
+    return { runtime, session, sessionManager: activeMgr };
+  };
+
+  // Transcript logging -- every prompt, tool call, and assistant reply is
+  // logged to stderr so journalctl shows the full conversation. Disable with
+  // PI_OMNI_WEB_LOG_TRANSCRIPT=0 if you want quieter logs.
+  const logTranscript = process.env.PI_OMNI_WEB_LOG_TRANSCRIPT !== "0";
+
+  // Extract a readable text payload from a content array | string. Falls back
+  // to JSON for non-text parts (images, etc.) so we never silently drop info.
+  const stringifyContent = (content: unknown): string => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return JSON.stringify(content);
+    const parts: string[] = [];
+    for (const p of content) {
+      if (!p || typeof p !== "object") continue;
+      const t = (p as { type?: string }).type;
+      if (t === "text" && typeof (p as { text?: unknown }).text === "string") {
+        parts.push((p as { text: string }).text);
+      } else {
+        parts.push(`[${t ?? "part"}]`);
+      }
+    }
+    return parts.join("");
+  };
+
+  // Split an assistant message into its text answer and the bracket-tagged
+  // structural parts (thinking, toolCall, ...). The two are logged on
+  // separate lines so it's obvious whether the model produced a
+  // user-visible answer at all, vs. only reasoning / tool calls.
+  const splitAssistantContent = (
+    content: unknown,
+  ): { answer: string; structure: string } => {
+    if (typeof content === "string") return { answer: content, structure: "" };
+    if (!Array.isArray(content)) {
+      return { answer: "", structure: JSON.stringify(content) };
+    }
+    const answerParts: string[] = [];
+    const structureParts: string[] = [];
+    for (const p of content) {
+      if (!p || typeof p !== "object") continue;
+      const t = (p as { type?: string }).type;
+      if (t === "text" && typeof (p as { text?: unknown }).text === "string") {
+        answerParts.push((p as { text: string }).text);
+      } else {
+        structureParts.push(`[${t ?? "part"}]`);
+      }
+    }
+    return { answer: answerParts.join(""), structure: structureParts.join("") };
+  };
+
+  const logEvent = (kind: string, payload: unknown): void => {
+    if (!logTranscript) return;
+    let body: string;
+    try {
+      body = typeof payload === "string" ? payload : JSON.stringify(payload);
+    } catch {
+      body = String(payload);
+    }
+    process.stderr.write(`[pi-omni] transcript ${kind}: ${body}\n`);
+  };
+
+  // Track per-connection runtimes so shutdown can dispose them all.
+  const liveRuntimes = new Set<{ dispose: () => Promise<void> }>();
+
+  const server = await startWebServer({
+    host,
+    port,
+    logger: log,
+    makeSession: async (ws, logger, requestedSessionId) => {
+      const { runtime, session, sessionManager } = await createPiSessionForConnection(logger, requestedSessionId);
+      liveRuntimes.add(runtime);
+
+      let webSession: WebSession | undefined;
+
+      // Per-connection event fan-out: events from THIS pi session route to
+      // THIS connection's WebSession only. The transcript log captures
+      // everything else (messages, tools).
+      const unsubscribe = session.subscribe((event: any) => {
+        const ws = webSession;
+        switch (event?.type) {
+          case "message_start": {
+            const msg = event.message;
+            const role = msg?.role;
+            if (role === "user") {
+              logEvent("user", stringifyContent(msg.content));
+            }
+            return;
+          }
+          case "message_update": {
+            const ame = event?.assistantMessageEvent;
+            if (!ame) return;
+            switch (ame.type) {
+              case "text_delta":
+                if (typeof ame.delta === "string") ws?.onLlmDelta(ame.delta);
+                return;
+              case "thinking_end":
+                if (typeof ame.content === "string") logEvent("thinking", ame.content);
+                ws?.onComponent({ kind: "thinking" });
+                return;
+              case "toolcall_end":
+                logEvent("toolcall", ame.toolCall);
+                ws?.onComponent({
+                  kind: "tool_call",
+                  name: (ame.toolCall as { name?: string } | undefined)?.name,
+                });
+                return;
+              case "error":
+                logEvent("ame_error", { reason: ame.reason, error: ame.error });
+                return;
+            }
+            return;
+          }
+          case "message_end": {
+            const msg = event.message;
+            if (msg?.role === "assistant") {
+              const { answer, structure } = splitAssistantContent(msg.content);
+              if (structure) logEvent("assistant_structure", structure);
+              if (answer) logEvent("assistant_answer", answer);
+              else logEvent("assistant_answer", "<empty -- no text block produced>");
+            } else if (msg?.role === "tool" || msg?.role === "toolResult") {
+              logEvent("tool_result", {
+                toolCallId: msg.toolCallId,
+                content: stringifyContent(msg.content),
+              });
+            }
+            return;
+          }
+          case "tool_execution_start":
+            logEvent("tool_call", { tool: event.toolName, args: event.args });
+            return;
+          case "tool_execution_end":
+            logEvent("tool_end", {
+              tool: event.toolName,
+              isError: event.isError,
+              result: event.result,
+            });
+            webSession?.onComponent({
+              kind: "tool_result",
+              name: typeof event.toolName === "string" ? event.toolName : undefined,
+              ok: !event.isError,
+            });
+            return;
+          case "turn_end":
+            ws?.onTurnEnd(event);
+            return;
+          case "agent_end":
+            ws?.onAgentEnd();
+            return;
+        }
+      });
+
+      const sendUserMessage = async (text: string): Promise<void> => {
+        logEvent("submit", text);
+        try {
+          if (session.isStreaming) {
+            logger("aborting in-flight turn for new voice prompt");
+            await session.abort();
+          }
+          webSession?.rearmTurn();
+          await session.prompt(text);
+        } catch (e) {
+          logger(`session.prompt error: ${(e as Error).message}`, "error");
+          webSession?.onAgentEnd();
+        }
+      };
+
+      let lastUserText: string | undefined;
+      let lastAssistantText: string | undefined;
+      try {
+        const context = sessionManager.buildSessionContext();
+        const messages = context.messages ?? [];
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i];
+          if (m.role === "user" && !lastUserText) {
+            lastUserText = stringifyContent(m.content);
+          } else if (m.role === "assistant" && !lastAssistantText) {
+            lastAssistantText = splitAssistantContent(m.content).answer;
+          }
+          if (lastUserText && lastAssistantText) break;
+        }
+      } catch (e) {
+        logger(`failed to extract session history: ${(e as Error).message}`, "warning");
+      }
+
+      webSession = new WebSession(
+        ws,
+        {
+          cfg,
+          client: sttTtsClient,
+          sendUserMessage: (text) => {
+            void sendUserMessage(text);
+          },
+          // onActivate/onDeactivate are no-ops now that each connection owns
+          // its own pi session -- there's no shared active-session to track.
+          onActivate: () => {},
+          onDeactivate: () => {},
+          logger,
+          history: { lastUserText, lastAssistantText },
+        },
+        sessionManager.getSessionId(),
+      );
+
+      // Wrap dispose so closing the WS also tears down this connection's
+      // pi runtime. Without this, every refresh would leak a session.
+      const origDispose = webSession.dispose.bind(webSession);
+      webSession.dispose = () => {
+        try {
+          unsubscribe();
+        } catch {}
+        origDispose();
+        liveRuntimes.delete(runtime);
+        void runtime.dispose().catch((e) => {
+          logger(`runtime.dispose error: ${(e as Error).message}`, "warning");
+        });
+      };
+
+      return webSession;
+    },
   });
-  res.end(data);
+
+  log(`serving at ${server.url}`);
+  // the one machine-parseable readiness line a parent process waits for; shared
+  // shape with fake-openai and the sibling pi-* servers.
+  process.stdout.write(`base_url=${server.url}\n`);
+
+  const shutdown = (): void => {
+    void (async () => {
+      try {
+        await server.close();
+      } catch {}
+      for (const r of liveRuntimes) {
+        try {
+          await r.dispose();
+        } catch {}
+      }
+      liveRuntimes.clear();
+      process.exit(0);
+    })();
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
-function notFound(res: ServerResponse, what?: string, log?: (m: string, l?: string) => void): void {
-  if (log && what) log(`404 ${what}`, "warning");
-  res.writeHead(404, { "Content-Type": "text/plain" });
-  res.end("not found");
-}
+void main().catch((e) => {
+  process.stderr.write(`[pi-omni] fatal: ${(e as Error).stack || e}\n`);
+  process.exit(1);
+});

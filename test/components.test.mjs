@@ -66,7 +66,7 @@ test("never contains emoji", () => {
 // ─── transient display reducer ──────────────────────────────────────
 // The assistant slot shows AT MOST ONE chip at a time (the most recent
 // indicator) OR the streaming answer text. Once text starts arriving,
-// the chip is dropped — the answer supersedes the in-progress meta.
+// the chip is dropped -- the answer supersedes the in-progress meta.
 
 test("initial state is empty", () => {
   assert.deepEqual(initialAssistant, { chip: null, text: "" });
@@ -98,7 +98,7 @@ test("full text clears the chip and replaces text", () => {
   assert.deepEqual(s, { chip: null, text: "Final answer." });
 });
 
-test("component AFTER text is ignored — chip must not reappear next to the answer", () => {
+test("component AFTER text is ignored -- chip must not reappear next to the answer", () => {
   // Once the answer text has begun streaming, late indicator events
   // (a delayed thinking_end fired after text_delta, or a follow-on
   // toolcall_end) must NOT reattach a chip. The answer is the durable

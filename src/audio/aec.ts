@@ -8,7 +8,7 @@ const CHANNELS = 1;
 
 export type AecOptions = {
   initialDelayMs: number;
-  // Process chain config. We disable AGC2/NS by default — we want clean
+  // Process chain config. We disable AGC2/NS by default -- we want clean
   // echo cancellation, not gain leveling. HPF (DC removal) is cheap and
   // helpful.
   enableHpf?: boolean;
@@ -135,7 +135,7 @@ export class Aec {
       this.refQueueBytes -= this.frameBytes;
       return Buffer.from(frame);
     }
-    // Frame straddles multiple queued buffers — concat the head until we have
+    // Frame straddles multiple queued buffers -- concat the head until we have
     // a whole frame.
     const parts: Buffer[] = [];
     let collected = 0;

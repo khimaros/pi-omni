@@ -84,7 +84,7 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
       // Need src samples at integer indices floor(pos) and floor(pos)+1.
       const i0 = Math.floor(this.pos);
       // If we don't have ANY source data buffered, output silence. We use
-      // strict `>=` (not `>`) — the last sample is allowed to interpolate
+      // strict `>=` (not `>`) -- the last sample is allowed to interpolate
       // against an implicit zero, which both fades cleanly and ensures
       // `queueSamples` actually reaches 0 so we can post `drained`.
       if (i0 >= this.queueSamples) {
@@ -118,7 +118,7 @@ registerProcessor("pcm-player", PcmPlayerProcessor);
 // Raw mono PCM capture for push-to-talk. Accumulates input quanta into
 // CAPTURE_CHUNK_SAMPLES-sized chunks and posts them to the main thread.
 // Unlike a ScriptProcessorNode, a capture worklet is pulled purely off its
-// input connection and needs no wiring to destination — so it opens no
+// input connection and needs no wiring to destination -- so it opens no
 // second output stream, which on mobile destabilizes the playback context
 // and crackles TTS.
 const CAPTURE_CHUNK_SAMPLES = 2048;

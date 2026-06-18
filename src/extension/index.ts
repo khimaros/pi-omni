@@ -1,449 +1,237 @@
-import { exec } from "node:child_process";
-import OpenAI from "openai";
-import { VoiceLoop } from "../audio/loop.js";
-import { loadConfig } from "../config.js";
-import { runOnboarding } from "./onboarding.js";
-import { startWebServer, type RunningServer } from "../server/index.js";
-import { WebSession } from "../server/session.js";
+// pi-omni extension entry point.
+//
+// registers an `--omni` flag (start the web voice server at launch) and an
+// `/omni` command for control from an interactive session. both spawn the
+// standalone entrypoint (src/server/index.ts) as a child and learn its address
+// from the `base_url=` handshake it prints -- the same standalone-bin-plus-
+// handshake model the sibling pi-* servers use.
+//
+// lifecycle is owned: the child is tied to this pi process and torn down when pi
+// quits. a pid file backs /omni status|stop and lets a fresh pi detect an orphan
+// left by a crashed one. for a server that outlives pi, run the installed
+// `pi-omni` command directly. the in-TUI voice mode lives in the pi-live package.
 
-type AnyExtensionAPI = {
-  on: (event: string, handler: (...args: unknown[]) => unknown) => void;
-  registerCommand: (
-    name: string,
-    options: {
-      description: string;
-      handler: (args: string, ctx: unknown) => Promise<void> | void;
-    },
-  ) => void;
-  registerShortcut?: (
-    shortcut: string,
-    options: {
-      description?: string;
-      handler: (...args: unknown[]) => Promise<void> | void;
-    },
-  ) => void;
-  registerFlag?: (
-    name: string,
-    options: {
-      description: string;
-      type: "boolean" | "string" | "number";
-      default?: unknown;
-    },
-  ) => void;
-  getFlag?: (name: string) => unknown;
-  sendUserMessage: (content: string, options?: unknown) => unknown;
-};
+import { exec, spawn, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
-type CmdCtx = {
-  ui: {
-    notify: (m: string, l?: string) => void;
-    setStatus: (id: string, t: string) => void;
-    input: (p: string, ph?: string) => Promise<string | undefined>;
-    select: (p: string, o: string[]) => Promise<string | undefined>;
-    confirm: (
-      t: string,
-      m: string,
-      o?: { timeout?: number },
-    ) => Promise<boolean>;
-  };
-};
+const OMNI_FLAG = "omni";
+const LISTEN_FLAG = "omni-listen";
+// matches the env the server reads (src/config.ts); kept in sync by name.
+const LISTEN_ENV = "PI_OMNI_LISTEN";
 
-// CmdCtx used when an action is triggered from a CLI flag rather than a
-// user-invoked command. UI prompts no-op; notify writes to stderr.
-function makeStubCtx(): CmdCtx {
-  return {
-    ui: {
-      notify: (m, l) => process.stderr.write(`[pi-omni] ${l ?? "info"}: ${m}\n`),
-      setStatus: () => {},
-      input: async () => undefined,
-      select: async () => undefined,
-      confirm: async () => false,
-    },
-  };
+// the standalone server bin is always the compiled dist/server/index.js, run with
+// plain node. pi loads this extension from .ts source (src/extension, via its jiti
+// loader); the tests load the compiled copy (dist/extension). resolve the bin for
+// either location.
+const HERE = dirname(fileURLToPath(import.meta.url));
+const BIN_PATH =
+	[join(HERE, "..", "server", "index.js"), join(HERE, "..", "..", "dist", "server", "index.js")].find(existsSync) ??
+	join(HERE, "..", "..", "dist", "server", "index.js");
+
+// the one machine-parseable readiness line the child prints once it is listening.
+const HANDSHAKE_PREFIX = "base_url=";
+const HANDSHAKE_TIMEOUT_MS = 10_000;
+
+// persisted so status/stop and orphan detection survive a pi restart.
+const PID_FILE = join(homedir(), ".pi", "extensions", "omni.pid");
+
+const SUBCOMMANDS = [
+	{ name: "start", label: "start  - launch the server" },
+	{ name: "status", label: "status - check server status" },
+	{ name: "stop", label: "stop   - stop the server" },
+	{ name: "open", label: "open   - open the web voice app in a browser" },
+];
+
+// the server this pi process owns. base_url is the real bound address from the
+// handshake, not an assumed one, so a port-0 / dynamic bind is reported correctly.
+let owned: { child: ChildProcess; baseUrl: string } | null = null;
+
+function readPid(): number | null {
+	try {
+		if (existsSync(PID_FILE)) return Number(readFileSync(PID_FILE, "utf8").trim()) || null;
+	} catch {
+		/* ignore */
+	}
+	return null;
 }
 
-export default async function (pi: AnyExtensionAPI): Promise<void> {
-  // Flags — register early so pi sees them on the command line.
-  pi.registerFlag?.("omni-live", {
-    description: "Start /omni-live (continuous voice mode) on launch.",
-    type: "boolean",
-    default: false,
-  });
-  pi.registerFlag?.("omni-web", {
-    description: "Start /omni-web server on launch (background HTTP/WS server).",
-    type: "boolean",
-    default: false,
-  });
+function writePid(pid: number): void {
+	try {
+		mkdirSync(dirname(PID_FILE), { recursive: true });
+		writeFileSync(PID_FILE, String(pid));
+	} catch {
+		/* ignore */
+	}
+}
 
-  let { cfg, fromFile } = await loadConfig();
-  const makeLoop = () =>
-    new VoiceLoop(pi, cfg, (msg, level) => {
-      try {
-        process.stderr.write(`[pi-omni] ${level ?? "info"}: ${msg}\n`);
-      } catch {}
-    });
-  let loop = makeLoop();
+function clearPid(): void {
+	try {
+		if (existsSync(PID_FILE)) unlinkSync(PID_FILE);
+	} catch {
+		/* ignore */
+	}
+}
 
-  let webServer: RunningServer | undefined;
-  let webSession: WebSession | undefined;
+function alive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
 
-  const runOmni = async (ctx: CmdCtx) => {
-    if (!fromFile) {
-      ctx.ui.notify("omni: no saved config — running first-time setup", "info");
-      const next = await runOnboarding(ctx, cfg);
-      if (!next) {
-        ctx.ui.notify("omni: setup cancelled", "warning");
-        return;
-      }
-      cfg = next;
-      fromFile = true;
-      loop.dispose();
-      loop = makeLoop();
-    }
-    await loop.toggle(ctx);
-  };
+function isOwnedLive(): boolean {
+	return owned !== null && !owned.child.killed;
+}
 
-  const runOmniLive = async (ctx: CmdCtx) => {
-    if (!fromFile) {
-      ctx.ui.notify("omni-live: no saved config — running setup first", "info");
-      const next = await runOnboarding(ctx, cfg);
-      if (!next) {
-        ctx.ui.notify("omni-live: setup cancelled", "warning");
-        return;
-      }
-      cfg = next;
-      fromFile = true;
-      loop.dispose();
-      loop = makeLoop();
-    }
-    await loop.toggleChat(ctx);
-  };
+// resolve once the child announces its base_url; reject if it dies or stalls first.
+function awaitHandshake(child: ChildProcess): Promise<string> {
+	return new Promise((resolve, reject) => {
+		let buf = "";
+		const finish = (fn: () => void) => {
+			clearTimeout(timer);
+			child.stdout?.off("data", onData);
+			child.off("exit", onExit);
+			fn();
+		};
+		const onData = (chunk: Buffer) => {
+			buf += chunk.toString();
+			for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+				const line = buf.slice(0, nl).trim();
+				buf = buf.slice(nl + 1);
+				if (line.startsWith(HANDSHAKE_PREFIX)) return finish(() => resolve(line.slice(HANDSHAKE_PREFIX.length)));
+			}
+		};
+		const onExit = (code: number | null) => finish(() => reject(new Error(`server exited before handshake (code ${code})`)));
+		const timer = setTimeout(() => finish(() => reject(new Error("timed out waiting for server handshake"))), HANDSHAKE_TIMEOUT_MS);
+		child.stdout?.on("data", onData);
+		child.once("exit", onExit);
+	});
+}
 
-  const startWeb = async (notify: (m: string, l?: string) => void) => {
-    if (webServer) {
-      notify(`omni-web: already running at ${webServer.url}`, "info");
-      return;
-    }
-    const host =
-      process.env.PI_VOICE_WEB_HOST ||
-      (cfg.webHost && cfg.webHost.length ? cfg.webHost : "127.0.0.1");
-    const port = Number(process.env.PI_VOICE_WEB_PORT) || cfg.webPort || 8788;
-    try {
-      webServer = await startWebServer({
-        host,
-        port,
-        logger: (m, l) =>
-          process.stderr.write(`[pi-omni] web ${l ?? "info"}: ${m}\n`),
-        makeSession: (ws, logger, requestedSessionId) => {
-          if (webSession) {
-            try {
-              webSession.dispose();
-            } catch {}
-          }
-          return new WebSession(ws, {
-            cfg,
-            client: new OpenAI({ baseURL: cfg.baseURL, apiKey: cfg.apiKey }),
-            sendUserMessage: async (text) => {
-              await pi.sendUserMessage(text, { deliverAs: "steer" });
-            },
-            onActivate: (s) => {
-              webSession = s;
-            },
-            onDeactivate: (s) => {
-              if (webSession === s) webSession = undefined;
-            },
-            logger,
-          });
-        },
-      });
-      notify(`omni-web: serving at ${webServer.url}`, "info");
-    } catch (e) {
-      notify(`omni-web: start failed — ${(e as Error).message}`, "error");
-    }
-  };
+// flag wins over env; either may be a "host:port" / ":port" / "port" spec.
+function resolveListen(pi: ExtensionAPI, override?: string): string | undefined {
+	if (override) return override;
+	const flag = pi.getFlag(LISTEN_FLAG);
+	if (typeof flag === "string" && flag) return flag;
+	return process.env[LISTEN_ENV] || undefined;
+}
 
-  const stopWeb = async (notify: (m: string, l?: string) => void) => {
-    if (!webServer) {
-      notify("omni-web: not running", "info");
-      return;
-    }
-    try {
-      await webServer.close();
-    } catch {}
-    webServer = undefined;
-    webSession = undefined;
-    notify("omni-web: stopped", "info");
-  };
+async function startServer(pi: ExtensionAPI, cwd: string, override?: string): Promise<string> {
+	if (isOwnedLive()) return `already serving at ${owned!.baseUrl}`;
+	const orphan = readPid();
+	if (orphan && alive(orphan)) return `already serving (pid ${orphan}); use /omni stop first`;
+	const listen = resolveListen(pi, override);
+	const args = [BIN_PATH, ...(listen ? ["--listen", listen] : [])];
+	const child = spawn(process.execPath, args, { cwd, stdio: ["ignore", "pipe", "inherit"] });
+	const baseUrl = await awaitHandshake(child);
+	child.stdout?.resume(); // drain any further output so the child never blocks on a full pipe
+	owned = { child, baseUrl };
+	writePid(child.pid!);
+	child.once("exit", () => {
+		if (owned?.child === child) owned = null;
+		clearPid();
+	});
+	return `serving at ${baseUrl} -- open it with /omni open`;
+}
 
-  pi.registerCommand("omni", {
-    description:
-      "Push-to-talk with VAD auto-stop: tap to start, VAD ends on silence (or re-tap to cancel).",
-    handler: async (_args, rawCtx) => {
-      await runOmni(rawCtx as CmdCtx);
-    },
-  });
+async function stopServer(): Promise<string> {
+	const target = isOwnedLive() ? owned!.child.pid : readPid();
+	if (!target || !alive(target)) return "server is not running";
+	const where = isOwnedLive() ? owned!.baseUrl : `pid ${target}`;
+	owned = null;
+	try {
+		process.kill(target, "SIGTERM");
+	} catch {
+		/* already gone */
+	}
+	clearPid();
+	return `stopped server at ${where}`;
+}
 
-  pi.registerCommand("omni-live", {
-    description:
-      "Continuous conversation mode: auto-loops record → STT → LLM → TTS → record. Run again or press the cancel key to stop.",
-    handler: async (_args, rawCtx) => {
-      await runOmniLive(rawCtx as CmdCtx);
-    },
-  });
+function statusText(): string {
+	if (isOwnedLive()) return `serving at ${owned!.baseUrl}`;
+	const pid = readPid();
+	return pid && alive(pid) ? `serving (pid ${pid})` : "server is not running";
+}
 
-  pi.registerCommand("omni-cancel", {
-    description: "Cancel any active voice output / recording / chat mode.",
-    handler: async (_args, rawCtx) => {
-      loop.cancelOutput(rawCtx as CmdCtx);
-    },
-  });
+// open the running web voice app in the default browser. only this pi process
+// knows the owned server's url; an orphan from another session opens from there.
+function openServer(): string {
+	if (isOwnedLive()) {
+		const url = owned!.baseUrl;
+		const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? 'start ""' : "xdg-open";
+		exec(`${cmd} "${url}"`);
+		return `opening ${url} in browser`;
+	}
+	const pid = readPid();
+	if (pid && alive(pid)) return "server is running but was started by another session; open it from there";
+	return "server is not running; run /omni start first";
+}
 
-  pi.registerCommand("omni-setup", {
-    description: "Configure pi-omni: endpoint, models, mic + speaker.",
-    handler: async (_args, rawCtx) => {
-      const ctx = rawCtx as CmdCtx;
-      const next = await runOnboarding(ctx, cfg);
-      if (!next) {
-        ctx.ui.notify("omni-setup: cancelled", "warning");
-        return;
-      }
-      cfg = next;
-      fromFile = true;
-      loop.dispose();
-      loop = makeLoop();
-      ctx.ui.notify("omni-setup: applied", "info");
-    },
-  });
+async function dispatch(name: string, pi: ExtensionAPI, ctx: ExtensionCommandContext, listen?: string): Promise<void> {
+	try {
+		if (name === "start") {
+			const msg = await startServer(pi, ctx.cwd, listen);
+			ctx.ui.notify(msg, msg.startsWith("serving") || msg.startsWith("already") ? "info" : "error");
+		} else if (name === "stop") {
+			ctx.ui.notify(await stopServer(), "info");
+		} else if (name === "status") {
+			ctx.ui.notify(statusText(), "info");
+		} else if (name === "open") {
+			ctx.ui.notify(openServer(), "info");
+		} else {
+			ctx.ui.notify(`unknown subcommand '${name}'. use start, stop, status, or open.`, "error");
+		}
+	} catch (err) {
+		ctx.ui.notify(`omni failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+	}
+}
 
-  const omniWebSubs: Array<{ name: string; label: string }> = [
-    { name: "start", label: "start  - launch the server" },
-    { name: "status", label: "status - check server status" },
-    { name: "stop", label: "stop   - stop the server" },
-    { name: "open", label: "open   - open in browser" },
-  ];
+async function pickAndRun(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+	const selected = await ctx.ui.select("pi-omni", SUBCOMMANDS.map((s) => s.label));
+	const sub = SUBCOMMANDS.find((s) => s.label === selected);
+	if (sub) await dispatch(sub.name, pi, ctx);
+}
 
-  const openOmniWeb = (notify: (m: string, l?: string) => void): void => {
-    if (!webServer) {
-      notify("omni-web: not running. run /omni-web start first.", "error");
-      return;
-    }
-    const url = webServer.url;
-    const cmd =
-      process.platform === "darwin"
-        ? `open "${url}"`
-        : process.platform === "win32"
-          ? `start "" "${url}"`
-          : `xdg-open "${url}"`;
-    try {
-      exec(cmd);
-      notify(`omni-web: opening ${url}`, "info");
-    } catch (e) {
-      notify(`omni-web: open failed — ${(e as Error).message}`, "error");
-    }
-  };
+export default function (pi: ExtensionAPI): void {
+	pi.registerFlag(OMNI_FLAG, { description: "start the pi-omni web voice server at launch", type: "boolean", default: false });
+	pi.registerFlag(LISTEN_FLAG, { description: "omni bind address (host:port, :port, or port). implies --omni", type: "string" });
 
-  const statusOmniWeb = (notify: (m: string, l?: string) => void): void => {
-    if (webServer) {
-      notify(
-        `omni-web: running at ${webServer.url}${webSession ? " (client connected)" : ""}`,
-        "info",
-      );
-    } else {
-      notify("omni-web: not running", "info");
-    }
-  };
+	pi.registerCommand("omni", {
+		description: "control the pi-omni web voice server (start|stop|status|open)",
+		getArgumentCompletions: (prefix) =>
+			SUBCOMMANDS.map((s) => s.name)
+				.filter((s) => s.startsWith(prefix))
+				.map((s) => ({ value: s, label: s })),
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const [sub, listenArg] = args.trim().split(/\s+/).filter(Boolean);
+			if (!sub) await pickAndRun(pi, ctx);
+			else await dispatch(sub, pi, ctx, listenArg);
+		},
+	});
 
-  const dispatchOmniWeb = async (
-    sub: string,
-    notify: (m: string, l?: string) => void,
-  ): Promise<boolean> => {
-    switch (sub) {
-      case "start":
-        await startWeb(notify);
-        return true;
-      case "stop":
-        await stopWeb(notify);
-        return true;
-      case "status":
-        statusOmniWeb(notify);
-        return true;
-      case "open":
-        openOmniWeb(notify);
-        return true;
-      default:
-        return false;
-    }
-  };
+	// auto-start when launched with --omni / --omni-listen; guarded so session
+	// swaps (new/resume/fork) do not relaunch a server we already own.
+	pi.on("session_start", async () => {
+		const listenFlag = pi.getFlag(LISTEN_FLAG);
+		const want = Boolean(pi.getFlag(OMNI_FLAG)) || (typeof listenFlag === "string" && listenFlag.length > 0);
+		if (!want || isOwnedLive()) return;
+		try {
+			const msg = await startServer(pi, process.cwd());
+			process.stderr.write(`pi-omni: ${msg}\n`);
+		} catch (err) {
+			process.stderr.write(`pi-omni: failed to start: ${err instanceof Error ? err.message : String(err)}\n`);
+		}
+	});
 
-  pi.registerCommand("omni-web", {
-    description: "control the pi-omni web server",
-    handler: async (args, rawCtx) => {
-      const ctx = rawCtx as CmdCtx;
-      const notify = (m: string, l?: string) => ctx.ui.notify(m, l);
-      const sub = (args || "").trim().toLowerCase();
-      if (!sub || sub === "help") {
-        const labels = omniWebSubs.map((s) => s.label);
-        const selected = await ctx.ui.select("pi-omni web", labels);
-        if (!selected) return;
-        const match = omniWebSubs.find((s) => s.label === selected);
-        if (match) await dispatchOmniWeb(match.name, notify);
-        return;
-      }
-      if (!(await dispatchOmniWeb(sub, notify))) {
-        notify(`omni-web: unknown subcommand: ${sub}`, "error");
-      }
-    },
-  });
-
-  pi.registerCommand("omni-test", {
-    description:
-      "Synthesize a test phrase via TTS and report bytes/content-type/player exit. Optional arg = phrase to say.",
-    handler: async (args, rawCtx) => {
-      const ctx = rawCtx as CmdCtx;
-      const phrase =
-        (args && args.trim()) || "The quick brown fox jumps over the lazy dog.";
-      try {
-        const diag = await loop.ttsPlayer.speakOnce(phrase);
-        const ct = diag.contentType ?? "?";
-        const ttfb = diag.ttfbMs != null ? `, ttfb=${diag.ttfbMs}ms` : "";
-        const httpErr = diag.httpError ? `, http: ${diag.httpError}` : "";
-        const player = diag.spawnError
-          ? `spawn err: ${diag.spawnError}`
-          : `player exit=${diag.exitCode} sig=${diag.signal ?? "-"}`;
-        const tail = diag.stderr
-          ? ` — ${diag.stderr.split("\n").slice(-2).join(" ").trim()}`
-          : "";
-        ctx.ui.notify(
-          `tts: ${diag.bytes}B pcm, ${diag.events} sse events, ${ct}${ttfb}, ${player}${tail}${httpErr}`,
-          "info",
-        );
-      } catch (e) {
-        ctx.ui.notify(`tts: synth failed: ${(e as Error).message}`, "error");
-      }
-    },
-  });
-
-  // Keyboard shortcuts.
-  const findCtx = (args: unknown[]): CmdCtx | undefined => {
-    for (const a of args) {
-      if (a && typeof a === "object" && "ui" in (a as object)) {
-        return a as CmdCtx;
-      }
-    }
-    return undefined;
-  };
-  const tryBind = (
-    key: string,
-    description: string,
-    fn: (ctx: CmdCtx) => Promise<void> | void,
-  ): void => {
-    if (!key || !pi.registerShortcut) return;
-    try {
-      pi.registerShortcut(key, {
-        description,
-        handler: async (...args: unknown[]) => {
-          const ctx = findCtx(args);
-          if (!ctx) {
-            process.stderr.write(
-              `[pi-omni] shortcut "${key}" fired but no ctx received — skipping\n`,
-            );
-            return;
-          }
-          await fn(ctx);
-        },
-      });
-    } catch (e) {
-      process.stderr.write(
-        `[pi-omni] failed to register shortcut "${key}": ${(e as Error).message}\n`,
-      );
-    }
-  };
-  tryBind(cfg.voiceShortcut, "Toggle pi-omni voice recording", runOmni);
-  // cancelShortcut (default "esc") is intentionally NOT bound via
-  // registerShortcut — that would swallow esc globally even when nothing's
-  // in flight, blocking pi's built-in esc behaviors. Instead the VoiceLoop
-  // installs a conditional onTerminalInput listener that only consumes esc
-  // while a voice turn or chat mode is active.
-
-  const bind = (rawCtx: unknown) => {
-    if (rawCtx && typeof rawCtx === "object" && "ui" in (rawCtx as object)) {
-      loop.bindCtx(rawCtx as CmdCtx);
-    }
-  };
-
-  pi.on("before_agent_start", (event: unknown, ctx: unknown) => {
-    bind(ctx);
-    const inFlight = loop.voiceTurnInFlight || webSession?.voiceTurnInFlight;
-    if (!inFlight) return undefined;
-    const prompt =
-      (webSession?.voiceTurnInFlight ? webSession.systemPrompt : undefined) ??
-      loop.systemPrompt;
-    if (!prompt) return undefined;
-    const e = event as { systemPrompt?: string };
-    const base = typeof e.systemPrompt === "string" ? e.systemPrompt : "";
-    return {
-      systemPrompt: base ? `${base}\n\n${prompt}` : prompt,
-    };
-  });
-
-  pi.on("message_update", (event: unknown, ctx: unknown) => {
-    bind(ctx);
-    const e = event as {
-      assistantMessageEvent?: { type?: string; delta?: string };
-    };
-    const ame = e?.assistantMessageEvent;
-    if (ame?.type === "text_delta" && typeof ame.delta === "string") {
-      loop.onLlmDelta(ame.delta);
-      webSession?.onLlmDelta(ame.delta);
-    }
-  });
-
-  pi.on("turn_end", (event: unknown, ctx: unknown) => {
-    bind(ctx);
-    loop.onTurnEnd(event);
-    webSession?.onTurnEnd(event);
-  });
-
-  pi.on("agent_end", (_event: unknown, ctx: unknown) => {
-    bind(ctx);
-    loop.onAgentEnd();
-    webSession?.onAgentEnd();
-  });
-
-  pi.on("session_shutdown", () => {
-    loop.dispose();
-    if (webServer) void webServer.close();
-    webSession?.dispose();
-  });
-
-  // Flag- and config-driven auto-start. Defer one tick so pi has finished
-  // parsing argv — getFlag() can return the default value if checked too early.
-  // the ctx may be stale by then (e.g. inside a pi-webui-spawned session that
-  // immediately switches sessions); flags are only meaningful for a top-level
-  // pi invocation, so swallow the stale-ctx error.
-  setImmediate(() => {
-    const stubCtx = makeStubCtx();
-    let wantWeb: boolean;
-    let wantLive: boolean;
-    try {
-      wantWeb = !!pi.getFlag?.("omni-web") || cfg.autoStartWeb;
-      wantLive = !!pi.getFlag?.("omni-live") || cfg.autoStartLive;
-    } catch {
-      return;
-    }
-    if (wantWeb) {
-      process.stderr.write("[pi-omni] --omni-web: starting server\n");
-      void startWeb(stubCtx.ui.notify);
-    }
-    if (wantLive) {
-      if (!fromFile) {
-        process.stderr.write(
-          "[pi-omni] --omni-live: no saved config; run /omni-setup first\n",
-        );
-      } else {
-        process.stderr.write("[pi-omni] --omni-live: starting continuous voice\n");
-        void runOmniLive(stubCtx);
-      }
-    }
-  });
+	// tear down only when pi is actually quitting, not on session replacement.
+	pi.on("session_shutdown", async (event) => {
+		if (event.reason === "quit") await stopServer();
+	});
 }

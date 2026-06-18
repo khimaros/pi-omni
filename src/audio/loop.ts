@@ -49,7 +49,7 @@ export type VoiceConfig = {
   ttsChunkSentences: boolean;
   // When true, request server-sent-event PCM streaming from the TTS endpoint
   // (stream_format=sse, first audio plays before the TTS call completes).
-  // When false, the endpoint returns the full PCM in one response — higher
+  // When false, the endpoint returns the full PCM in one response -- higher
   // first-audio latency but works with TTS servers that don't speak SSE.
   // Orthogonal to ttsChunkSentences: you can chunk into sentences without
   // SSE (each sentence is a single non-streamed call), or stream audio for
@@ -138,7 +138,7 @@ export class VoiceLoop {
   private latestCtx?: CmdCtx;
   private escUnsub?: () => void;
   private chunker = new SentenceChunker();
-  // Whether we received any streamed deltas this turn — if so, turn_end just
+  // Whether we received any streamed deltas this turn -- if so, turn_end just
   // flushes the chunker rather than enqueueing the full assistant text again.
   private sawDeltasThisTurn = false;
   // AEC stack: pre-built once if cfg.aecEnabled, then mic chunks are routed
@@ -176,7 +176,7 @@ export class VoiceLoop {
           );
         }
       } catch (e) {
-        logger?.(`aec: init failed, continuing without — ${(e as Error).message}`, "warning");
+        logger?.(`aec: init failed, continuing without -- ${(e as Error).message}`, "warning");
       }
     }
     // Mic capture rate is forced to AEC rate when AEC is on (APM needs 16k).
@@ -226,7 +226,7 @@ export class VoiceLoop {
         onSpeechEnd: () => this.onVadSpeechEnd(),
       }).catch((e) => {
         this.loopLogger?.(
-          `silero: init failed, VAD disabled — ${(e as Error).message}`,
+          `silero: init failed, VAD disabled -- ${(e as Error).message}`,
           "warning",
         );
         throw e;
@@ -243,7 +243,7 @@ export class VoiceLoop {
   private onVadSpeechStart(): void {
     if (Date.now() < this.vadGuardUntilMs) return;
     if (this.vadMode === "recording") {
-      this.status("speech detected — listening…");
+      this.status("speech detected -- listening…");
     } else if (this.vadMode === "barge") {
       this.onBargeIn();
     }
@@ -252,12 +252,12 @@ export class VoiceLoop {
   private onVadSpeechEnd(): void {
     if (Date.now() < this.vadGuardUntilMs) return;
     if (this.vadMode !== "recording") return;
-    this.status("end of speech — stopping mic");
+    this.status("end of speech -- stopping mic");
     void this.handleAutoStop();
   }
 
   // Reference path: TTS PCM about to hit the speaker. Resample if needed,
-  // push to the canceller. Best-effort — errors are swallowed.
+  // push to the canceller. Best-effort -- errors are swallowed.
   private onTtsPcm(pcm: Buffer): void {
     if (!this.aec) return;
     const at16 = this.refResampler ? this.refResampler.process(pcm) : pcm;
@@ -266,6 +266,11 @@ export class VoiceLoop {
 
   get voiceTurnInFlight(): boolean {
     return this.voiceTurnActive;
+  }
+
+  // true while continuous conversation mode is active (between/around turns).
+  get inChatMode(): boolean {
+    return this.chatMode;
   }
 
   get systemPrompt(): string {
@@ -288,7 +293,7 @@ export class VoiceLoop {
   // Re-attach the esc handler against the latest ctx. We use
   // onTerminalInput (returns `{consume:true}` to swallow, undefined to pass
   // through) instead of a global pi.registerShortcut so esc only acts during
-  // an active voice turn / chat mode — when nothing's in flight the key
+  // an active voice turn / chat mode -- when nothing's in flight the key
   // falls through to pi's built-in esc handlers (cancel picker, etc.).
   private rebindEsc(ctx: CmdCtx): void {
     if (typeof (ctx.ui as { onTerminalInput?: unknown }).onTerminalInput !== "function") {
@@ -328,7 +333,7 @@ export class VoiceLoop {
       ctx.ui.notify("voice: still processing previous turn", "warning");
       return;
     }
-    // idle — also barge-in: kill any TTS that's still playing
+    // idle -- also barge-in: kill any TTS that's still playing
     this.tts.cancel();
     await this.startRecording(ctx);
   }
@@ -348,7 +353,7 @@ export class VoiceLoop {
     }
     this.chatMode = true;
     this.chatCtx = ctx;
-    this.status("voice-live: started — esc to stop");
+    this.status("voice-live: started -- esc to stop");
     if (this.state === "idle" && this.tts.idle) {
       this.tts.cancel();
       await this.startRecording(ctx);
@@ -406,14 +411,14 @@ export class VoiceLoop {
     this.state = "recording";
     this.maxRecordingTimer = setTimeout(() => {
       if (this.state === "recording") {
-        this.status("max recording duration hit — stopping");
+        this.status("max recording duration hit -- stopping");
         void this.handleAutoStop();
       }
     }, this.cfg.vadMaxRecordingMs);
     this.status(
       this.cfg.vadEnabled
-        ? "recording — VAD will auto-stop on silence; /omni cancels"
-        : "recording — /omni again to stop",
+        ? "recording -- VAD will auto-stop on silence; /omni cancels"
+        : "recording -- /omni again to stop",
     );
   }
 
@@ -464,7 +469,7 @@ export class VoiceLoop {
       this.maybeChatRestart();
       return;
     }
-    this.status("STT complete — sending to LLM");
+    this.status("STT complete -- sending to LLM");
     this.state = "thinking";
     this.agentEnded = false;
     this.voiceTurnActive = true;
@@ -505,7 +510,7 @@ export class VoiceLoop {
     this.generation += 1;
     this.voiceTurnActive = false;
     // Swap into recording mode with a fresh VAD reset; mic is already streaming.
-    this.status("barge-in — listening");
+    this.status("barge-in -- listening");
     this.recordedPcm = [];
     this.silero?.reset();
     this.vadMode = "recording";
@@ -516,7 +521,7 @@ export class VoiceLoop {
     }
     this.maxRecordingTimer = setTimeout(() => {
       if (this.state === "recording") {
-        this.status("max recording duration hit — stopping");
+        this.status("max recording duration hit -- stopping");
         void this.handleAutoStop();
       }
     }, this.cfg.vadMaxRecordingMs);
@@ -544,7 +549,7 @@ export class VoiceLoop {
   // End-of-turn flush. Two paths:
   //  - sentence-streaming: emit any buffered partial (handles replies that
   //    end without terminal punctuation) and stop.
-  //  - block mode (or no deltas were seen — extension bus didn't forward
+  //  - block mode (or no deltas were seen -- extension bus didn't forward
   //    message_update): sanitize the whole assistant text and enqueue once.
   onTurnEnd(event: unknown): void {
     if (this.state !== "thinking") return;
@@ -559,7 +564,7 @@ export class VoiceLoop {
     if (!raw) return;
     const text = sanitizeForSpeech(raw);
     if (!text) return;
-    this.status("assistant block complete — sending to TTS");
+    this.status("assistant block complete -- sending to TTS");
     this.tts.enqueue(text);
   }
 

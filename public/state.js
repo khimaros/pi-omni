@@ -1,5 +1,5 @@
 // Pure state machine for the voice UI. No DOM access, no async, no
-// timers — every input is an event, every output is a {state, actions}
+// timers -- every input is an event, every output is a {state, actions}
 // pair where `actions` are pure descriptions of side effects the driver
 // (app.js) is responsible for performing.
 //
@@ -12,7 +12,7 @@
 //
 // All of the timing-race bugs we've hit live in the interaction between
 // session-mode transitions (open/close mic + chime) and async server
-// events (transcript, tts_start, first PCM) — those are exactly the
+// events (transcript, tts_start, first PCM) -- those are exactly the
 // transitions enumerated here, which is the point of pulling it out.
 
 export const PHASES = [
@@ -39,7 +39,7 @@ export const initialState = Object.freeze({
   // TTS in flight from the server's POV. Set true on first tts_start of
   // a turn; cleared when the worklet has drained AND the server has sent
   // tts_end. Subsequent tts_starts within the same turn (sentence-chunked
-  // streaming) do NOT flip phase — see TTS_START below.
+  // streaming) do NOT flip phase -- see TTS_START below.
   speaking: false,
   // LLM loop is active: true between TRANSCRIPT and AGENT_END.
   thinking: false,
@@ -50,16 +50,16 @@ export const initialState = Object.freeze({
   // CLOSE_DONE: if phase is still "paused" (no server race) we apply it.
   pendingClose: null,
   // What kind of mic-open is in flight. The OPEN_DONE event checks this
-  // against sessionMode — if the user toggled away while the open was
+  // against sessionMode -- if the user toggled away while the open was
   // running, we drop the result and the driver runs the close.
   pendingOpen: null, // null | "live" | "ptt"
   // True once any LLM text (delta or full) has streamed for the current
   // turn. Reset on TRANSCRIPT (new turn boundary). On AGENT_END, if
   // false, the reducer emits SHOW_PLACEHOLDER so the driver can render
-  // a "(no response)" hint in the assistant slot — otherwise an empty
+  // a "(no response)" hint in the assistant slot -- otherwise an empty
   // turn (only reasoning / tool calls) looks like a hung UI.
   gotText: false,
-  // True once the new turn has shown ANY activity — a COMPONENT
+  // True once the new turn has shown ANY activity -- a COMPONENT
   // (thinking/tool) or an LLM_TEXT. Reset on TRANSCRIPT. Used by
   // AGENT_END to distinguish a stale prior-turn agent_end (no
   // activity yet → suppress placeholder) from a real empty-of-text
@@ -113,7 +113,7 @@ function withPhase(state, newPhase, extraActions = []) {
 
   // Deferred mic release: if we just moved to a resting phase while in
   // pause mode, and the mic is still open, close it now. Skip when the
-  // caller is already emitting a CLOSE_* action — that close path runs
+  // caller is already emitting a CLOSE_* action -- that close path runs
   // the chime BEFORE releasing the mic, and a parallel RELEASE_MIC
   // would race ahead and pause the mic mid-chime, clipping it.
   const isActive = isArp || newPhase === "speaking";
@@ -132,7 +132,7 @@ function withPhase(state, newPhase, extraActions = []) {
 
 // Barge-in helper: stop local TTS playback and tell the server to halt
 // the current synthesis so the user can speak without the assistant
-// talking over them. The LLM loop is NOT cancelled here — when the new
+// talking over them. The LLM loop is NOT cancelled here -- when the new
 // utterance's STT lands, the server's "new prompt arrived mid-turn"
 // path aborts the in-flight LLM call and runs the new turn fresh.
 // No-op when no TTS is in flight.
@@ -183,7 +183,7 @@ const HANDLERS = {
         return { state: next, actions };
       }
       // Begin opening live mode. Phase stays paused (no glow) until the
-      // mic is actually open — OPEN_DONE flips us to listening.
+      // mic is actually open -- OPEN_DONE flips us to listening.
       return {
         state: { ...state, sessionMode: "live", pendingOpen: "live" },
         actions: [{ type: "OPEN_LIVE" }],
@@ -198,7 +198,7 @@ const HANDLERS = {
         ]
       : [];
     // If a turn is in flight server-side (transcribing/thinking/synthesizing
-    // or speaking), the user pressing pause only closes the mic — the
+    // or speaking), the user pressing pause only closes the mic -- the
     // turn continues. Leaving the phase alone keeps the arp playing
     // through to its natural end (PCM_FIRST → speaking) and the closing
     // handlers (TTS_END+drained, AGENT_END) settle to "paused" via
@@ -224,10 +224,10 @@ const HANDLERS = {
   HOLD(state) {
     // HOLD is only meaningful from a fully paused state. Holding while
     // already in PTT is a no-op (already capturing); holding from live
-    // is intentionally rejected — switching capture modes mid-session
+    // is intentionally rejected -- switching capture modes mid-session
     // is confusing UX, and the user can always tap to pause first.
     if (state.sessionMode !== "pause") return { state, actions: [] };
-    // Cancel any in-flight server turn — symmetric with VAD barge-in.
+    // Cancel any in-flight server turn -- symmetric with VAD barge-in.
     const { state: cancelled, actions: cancelActions } = cancelInFlight(state);
     const next = {
       ...cancelled,
@@ -267,7 +267,7 @@ const HANDLERS = {
 
   OPEN_DONE(state, { kind }) {
     if (state.pendingOpen !== kind || state.sessionMode !== kind) {
-      // User toggled away while opening — driver will run the close.
+      // User toggled away while opening -- driver will run the close.
       return { state: { ...state, pendingOpen: null }, actions: [] };
     }
     const next = { ...state, pendingOpen: null, micOpen: kind === "live" };
@@ -298,7 +298,7 @@ const HANDLERS = {
   CLOSE_DONE(state, { hadAudio = true } = {}) {
     const target = state.pendingClose;
     const next = { ...state, pendingClose: null, micOpen: false };
-    // Only advance if we're still at "paused" — the server may have
+    // Only advance if we're still at "paused" -- the server may have
     // raced ahead (transcript / tts_start / pcm_first) while the mic-
     // close + chime were running. In that case the more advanced phase
     // wins and we don't downgrade.
@@ -357,14 +357,14 @@ const HANDLERS = {
 
   COMPONENT(state) {
     // Server emitted a thinking_end / tool_call / tool_result for the
-    // current turn. Pure activity signal — no phase change, no actions.
+    // current turn. Pure activity signal -- no phase change, no actions.
     // Used by AGENT_END to gate the placeholder.
     if (state.sawTurnActivity) return { state, actions: [] };
     return { state: { ...state, sawTurnActivity: true }, actions: [] };
   },
 
   LLM_TEXT(state) {
-    // Unambiguous evidence that the current turn is producing — set
+    // Unambiguous evidence that the current turn is producing -- set
     // the thinking flag and, if the phase has regressed (e.g., a stale
     // AGENT_END from a cancelled prior turn slipped through and bumped
     // us to paused/listening), restore "thinking". Phases that already
@@ -423,7 +423,7 @@ const HANDLERS = {
     if (next.speaking) return { state: next, actions: placeholderActions };
     // If we're already waiting for a new turn (recording the user, or
     // mid-STT for the next utterance after a barge-in), don't regress
-    // phase — a stale AGENT_END from a cancelled turn would otherwise
+    // phase -- a stale AGENT_END from a cancelled turn would otherwise
     // strand the UI in paused/listening until the next event lands.
     if (state.phase === "transcribing" || state.phase === "recording") {
       return { state: next, actions: placeholderActions };

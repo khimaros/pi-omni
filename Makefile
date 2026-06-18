@@ -1,6 +1,6 @@
 TS_SOURCES        := $(shell find src test -name '*.ts' 2>/dev/null)
 
-.PHONY: build lint test precommit install update pack publish wasm clean adb-reverse adb-unreverse
+.PHONY: build lint test test-integration precommit install update pack publish wasm clean adb-reverse adb-unreverse
 
 PORT ?= 4962
 
@@ -21,9 +21,16 @@ test: build
 	@echo "==> test"
 	@npm test
 
-precommit: lint test
+# black-box python integration test: builds, then spawns the standalone bin and
+# drives the voice pipeline against fake-openai. auto-skips when the mock binary
+# or node are unavailable.
+test-integration: build
+	@echo "==> test-integration"
+	@python3 test/fake_openai_test.py
 
-install:
+precommit: lint test test-integration
+
+install: build
 	@npm install -g .
 
 pack: build

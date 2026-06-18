@@ -1,5 +1,5 @@
 // Pure-reducer tests for public/state.js. Imports the browser module
-// directly — it has no DOM/window deps, so node can run it as-is.
+// directly -- it has no DOM/window deps, so node can run it as-is.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -102,7 +102,7 @@ test("TAP from live during mid-utterance flushes VAD buffer", () => {
   assert.equal(state.phase, "paused"); // glow cleared immediately
   assert.equal(state.vadSpeaking, false);
   assert.equal(state.pendingClose, "transcribing");
-  // Flush before close. CLOSE_LIVE owns the mic release — no parallel
+  // Flush before close. CLOSE_LIVE owns the mic release -- no parallel
   // RELEASE_MIC (see "TAP from live closes to paused" for the rationale).
   assert.deepEqual(actionTypes(actions), [
     "WS_FLUSH_VAD",
@@ -134,7 +134,7 @@ test("CLOSE_DONE does NOT clobber phase if server already advanced", () => {
     { type: "OPEN_DONE", kind: "live" },
     { type: "VAD_SPEECH_START" },
     { type: "TAP" }, // pendingClose=transcribing, phase=paused
-    { type: "TRANSCRIPT" }, // server raced ahead — phase=thinking
+    { type: "TRANSCRIPT" }, // server raced ahead -- phase=thinking
   ]).state;
   assert.equal(closing.phase, "thinking");
   const { state } = reduce(closing, { type: "CLOSE_DONE" });
@@ -265,7 +265,7 @@ test("subsequent TTS_START within a turn does NOT flip phase or restart arp", ()
   assert.equal(midTurn.phase, "speaking");
   assert.equal(midTurn.speaking, true);
 
-  // Sentence 2 begins — server emits another TTS_START.
+  // Sentence 2 begins -- server emits another TTS_START.
   const { state, actions } = reduce(midTurn, { type: "TTS_START" });
   assert.equal(state.phase, "speaking"); // unchanged
   assert.equal(state.speaking, true);
@@ -325,8 +325,8 @@ test("TAP+HOLD during TTS playback cancels and goes to recording (PTT barge-in)"
   assert.ok(cancel, "HOLD mid-turn must send a cancel to the server");
 });
 
-test("TAP+HOLD during thinking opens PTT without cancelling — server aborts LLM on new prompt", () => {
-  // No TTS playing yet — cancelInFlight is a no-op. The LLM stays
+test("TAP+HOLD during thinking opens PTT without cancelling -- server aborts LLM on new prompt", () => {
+  // No TTS playing yet -- cancelInFlight is a no-op. The LLM stays
   // alive; server-side abort happens when the PTT utterance lands.
   const thinking = run([
     { type: "TAP" },
@@ -342,7 +342,7 @@ test("TAP+HOLD during thinking opens PTT without cancelling — server aborts LL
   const { state, actions } = reduce(thinking, { type: "HOLD" });
   assert.equal(state.sessionMode, "ptt");
   assert.equal(state.phase, "recording");
-  assert.equal(state.thinking, true, "thinking preserved — server handles LLM abort");
+  assert.equal(state.thinking, true, "thinking preserved -- server handles LLM abort");
   assert.ok(!hasAction(actions, "WORKLET_RESET"));
   assert.ok(!actions.some((a) => a.type === "WS_SEND" && a.msg?.type === "cancel"));
 });
@@ -370,7 +370,7 @@ test("TAP+HOLD during synthesizing cancels TTS but leaves thinking alive", () =>
   assert.ok(cancel);
 });
 
-test("VAD_SPEECH_START during thinking does not cancel — server handles it on new prompt", () => {
+test("VAD_SPEECH_START during thinking does not cancel -- server handles it on new prompt", () => {
   const thinking = run([
     { type: "TAP" },
     { type: "OPEN_DONE", kind: "live" },
@@ -385,7 +385,7 @@ test("VAD_SPEECH_START during thinking does not cancel — server handles it on 
 });
 
 test("barge-in via TAP+HOLD stops the arpeggio (was thinking/synthesizing)", () => {
-  // thinking is in ARP_PHASES — entering recording must emit ARP_STOP.
+  // thinking is in ARP_PHASES -- entering recording must emit ARP_STOP.
   const thinking = run([
     { type: "TAP" },
     { type: "OPEN_DONE", kind: "live" },
@@ -427,7 +427,7 @@ test("barge-in via VAD_SPEECH_START stops the arpeggio (was thinking)", () => {
 test("stale TRANSCRIPT during recording (post-barge via VAD) does not clobber phase", () => {
   // User started speaking again while the previous utterance's STT was
   // still running on the server. The late TRANSCRIPT lands while we're
-  // in recording — it must update thinking flag but leave phase alone.
+  // in recording -- it must update thinking flag but leave phase alone.
   const recording = run([
     { type: "TAP" },
     { type: "OPEN_DONE", kind: "live" },
@@ -467,7 +467,7 @@ test("stale AGENT_END from cancelled turn does not reset phase while new STT is 
   // the in-flight turn and starts STT on the new utterance. Late
   // tts_cancel + agent_end from the cancelled turn arrive AFTER
   // CLOSE_DONE has advanced us to "transcribing". They must NOT regress
-  // phase to "paused" (restingPhase for sessionMode=pause) — that
+  // phase to "paused" (restingPhase for sessionMode=pause) -- that
   // strands the UI: when the new turn's TRANSCRIPT arrives later we
   // wake back up, but the brief paused flicker stops the arp and the
   // user perceives a "no response" gap. Worse, if the new TRANSCRIPT
@@ -490,24 +490,24 @@ test("stale AGENT_END from cancelled turn does not reset phase while new STT is 
   assert.equal(transcribing.phase, "transcribing");
   assert.equal(transcribing.thinking, true, "old turn's thinking still set");
 
-  // Stale tts_cancel from the cancelled turn — should not flip phase.
+  // Stale tts_cancel from the cancelled turn -- should not flip phase.
   const afterCancel = reduce(transcribing, { type: "TTS_CANCEL" }).state;
   assert.equal(afterCancel.phase, "transcribing");
 
-  // Stale agent_end from the cancelled turn — must NOT regress phase.
+  // Stale agent_end from the cancelled turn -- must NOT regress phase.
   // It also leaves thinking alone since we treat no-activity ends as
   // a no-op (the real new-turn end will clear thinking later).
   const { state: afterAgentEnd, actions } = reduce(afterCancel, { type: "AGENT_END" });
   assert.equal(afterAgentEnd.phase, "transcribing",
     "stale AGENT_END must not regress phase while new STT is pending");
   assert.equal(afterAgentEnd.thinking, true,
-    "stale AGENT_END is a no-op — thinking stays until real new-turn end");
+    "stale AGENT_END is a no-op -- thinking stays until real new-turn end");
   assert.ok(!hasAction(actions, "ARP_STOP"), "arp must keep playing through the stale agent_end");
 });
 
 test("barge-in spans LLM completion: HOLD mid-speaking, AGENT_END arrives while held, RELEASE later", () => {
   // User HOLDs during TTS playback (cancelInFlight fires). The server
-  // continues to drain the cancelled turn — its agent_end arrives
+  // continues to drain the cancelled turn -- its agent_end arrives
   // while the user is STILL holding (mid-recording). With my fix, the
   // server suppresses that agent_end so the client never sees it. But
   // if it leaks through (network reorder, server bug), the reducer
@@ -522,7 +522,7 @@ test("barge-in spans LLM completion: HOLD mid-speaking, AGENT_END arrives while 
     { type: "TTS_START" },
     { type: "PCM_FIRST" },             // phase=speaking
     { type: "TAP" },                   // mid-turn pause (HOLD-from-live is no-op)
-    { type: "HOLD" },                  // PTT barge — cancelInFlight, phase=recording
+    { type: "HOLD" },                  // PTT barge -- cancelInFlight, phase=recording
     { type: "OPEN_DONE", kind: "ptt" },
   ]).state;
   assert.equal(recording.phase, "recording");
@@ -561,7 +561,7 @@ test("barge-in spans LLM completion: HOLD mid-speaking, AGENT_END arrives while 
 
 test("AGENT_END arriving after an interrupt does not flip phase back", () => {
   // After a HOLD-driven barge-in, the server's in-flight AGENT_END may
-  // arrive late. We're now in PTT/recording — that must not be
+  // arrive late. We're now in PTT/recording -- that must not be
   // clobbered by the stale AGENT_END from the cancelled turn.
   const post = run([
     { type: "TAP" },
@@ -591,7 +591,7 @@ test("WORKLET_DRAINED while still in recording (post-barge) does not clobber pha
     { type: "TRANSCRIPT" },
     { type: "TTS_START" },
     { type: "PCM_FIRST" },
-    { type: "VAD_SPEECH_START" }, // barge — speaking flipped to false, workletEmpty=true
+    { type: "VAD_SPEECH_START" }, // barge -- speaking flipped to false, workletEmpty=true
     { type: "TTS_END" }, // late tts_end from the cancelled turn
   ]).state;
   // maybeEndSpeaking sees speaking=false, so noop.
@@ -613,7 +613,7 @@ test("TAP during thinking in live keeps the arp running until the turn ends natu
   assert.equal(thinking.thinking, true);
 
   // User presses pause mid-turn. Mic should close, but the LLM/TTS
-  // pipeline continues server-side — the arp must keep playing through
+  // pipeline continues server-side -- the arp must keep playing through
   // thinking → synthesizing → speaking and only stop at the natural
   // exit (PCM_FIRST → speaking), exactly as if no pause had happened.
   const { state, actions } = reduce(thinking, { type: "TAP" });
@@ -666,7 +666,7 @@ test("AGENT_END after LLM_TEXT does NOT emit SHOW_PLACEHOLDER", () => {
 
 test("TRANSCRIPT resets the LLM_TEXT-seen flag for the next turn", () => {
   // After a normal turn with text, a NEW turn that ends with no text
-  // must still emit the placeholder — the flag is per-turn, not sticky.
+  // must still emit the placeholder -- the flag is per-turn, not sticky.
   const afterFirstTurn = run([
     { type: "TAP" },
     { type: "OPEN_DONE", kind: "live" },
@@ -760,7 +760,7 @@ test("OPEN_DONE for stale open (user toggled away) is ignored", () => {
   // User opens live, then immediately toggles back to pause before
   // OPEN_DONE arrives.
   const opening = reduce(initialState, { type: "TAP" }).state;
-  // User taps again to go back — but pendingOpen is "live" and
+  // User taps again to go back -- but pendingOpen is "live" and
   // sessionMode is "live", so TAP would close it. Drive that:
   const closing = reduce(opening, { type: "TAP" }).state;
   assert.equal(closing.sessionMode, "pause");
@@ -775,7 +775,7 @@ test("OPEN_DONE for stale open (user toggled away) is ignored", () => {
 
 test("VAD_MISFIRE after barge-in cancel goes to thinking (LLM loop still active)", () => {
   // Barge-in cleared `speaking` (TTS was cancelled) but left thinking=true.
-  // A subsequent misfire should not flip back to speaking — there's nothing
+  // A subsequent misfire should not flip back to speaking -- there's nothing
   // to speak. Thinking is the right surface: the server may retry.
   const post = run([
     { type: "TAP" },
@@ -815,7 +815,7 @@ test("VAD_SPEECH_END action carries the configured capture rate", () => {
 // regressing phase to paused with placeholder fired. The user then
 // sees a dim/paused orb while the new turn is in fact streaming text.
 // LLM_TEXT (delta or full) is unambiguous evidence the LLM is producing
-// for the current turn — it must restore the thinking phase.
+// for the current turn -- it must restore the thinking phase.
 
 test("stale AGENT_END is a no-op; phase + thinking preserved for new turn", () => {
   // PTT round-trip up to "phase=thinking" for the new turn.
@@ -833,7 +833,7 @@ test("stale AGENT_END is a no-op; phase + thinking preserved for new turn", () =
     "stale AGENT_END (no activity yet) must not regress phase");
   assert.equal(stale.thinking, true, "thinking flag preserved");
   assert.ok(!hasAction(staleActions, "ARP_STOP"), "arp must keep playing");
-  // First delta of the real new turn — phase already thinking, just
+  // First delta of the real new turn -- phase already thinking, just
   // updates gotText/sawTurnActivity.
   const { state, actions } = reduce(stale, { type: "LLM_TEXT" });
   assert.equal(state.phase, "thinking");
@@ -900,11 +900,11 @@ test("LLM_TEXT restores thinking after stale AGENT_END on VAD barge path", () =>
 // ─── stale AGENT_END placeholder workaround ────────────────────────
 // The server SHOULD suppress prior-turn agent_end via TurnLifecycle
 // cancellation, but we've observed it leaking through in production
-// (root cause TBD — pi runtime drain ordering). The client-side
+// (root cause TBD -- pi runtime drain ordering). The client-side
 // workaround: only emit SHOW_PLACEHOLDER on AGENT_END if the new turn
 // has shown SOME activity (a COMPONENT event for thinking/tool, or
 // an LLM_TEXT). A bare AGENT_END arriving right after TRANSCRIPT,
-// with no activity in between, is almost certainly stale — show no
+// with no activity in between, is almost certainly stale -- show no
 // placeholder.
 
 test("AGENT_END right after TRANSCRIPT with no activity does NOT fire placeholder", () => {
@@ -968,7 +968,7 @@ test("COMPONENT event sets sawTurnActivity but doesn't change phase", () => {
 
 test("TRANSCRIPT resets sawTurnActivity for a new turn", () => {
   // Activity from a prior turn must not satisfy the placeholder guard
-  // for the next turn — fresh utterance fresh slate.
+  // for the next turn -- fresh utterance fresh slate.
   const after1 = run([
     { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
     { type: "RELEASE" }, { type: "CLOSE_DONE", hadAudio: true },
@@ -1083,7 +1083,7 @@ test("stale AGENT_END (no activity yet) does NOT regress phase from thinking", (
   ]).state;
   const { state, actions } = reduce(ptt, { type: "AGENT_END" });
   assert.equal(state.phase, "thinking",
-    "stale agent_end must not regress phase — keeps arp running");
+    "stale agent_end must not regress phase -- keeps arp running");
   assert.ok(!hasAction(actions, "ARP_STOP"));
   assert.ok(!hasAction(actions, "SHOW_PLACEHOLDER"));
 });
@@ -1096,12 +1096,12 @@ test("stale AGENT_END preserves the thinking flag (turn isn't really over)", () 
   ]).state;
   const { state } = reduce(ptt, { type: "AGENT_END" });
   assert.equal(state.thinking, true,
-    "stale end must not clear thinking — real turn is still in progress");
+    "stale end must not clear thinking -- real turn is still in progress");
 });
 
 test("real AGENT_END (after activity, no text) still regresses to resting + placeholder", () => {
   // Empty-of-text turn: activity occurred (thinking_end component
-  // fired) but no LLM_TEXT — this is a legit empty turn, the existing
+  // fired) but no LLM_TEXT -- this is a legit empty turn, the existing
   // behavior must continue: phase → resting, placeholder shown.
   const post = run([
     { type: "HOLD" }, { type: "OPEN_DONE", kind: "ptt" },
@@ -1155,9 +1155,9 @@ test("barge-in during transcribing: full cycle returns to listening", () => {
     // Barge-in during STT.
     { type: "VAD_SPEECH_START" },       // → recording (barge)
     { type: "VAD_SPEECH_END" },         // → transcribing (second utterance)
-    // First STT returns — stale TRANSCRIPT, but still processes.
+    // First STT returns -- stale TRANSCRIPT, but still processes.
     { type: "TRANSCRIPT" },             // → thinking
-    // Second STT returns — real TRANSCRIPT for the new utterance.
+    // Second STT returns -- real TRANSCRIPT for the new utterance.
     { type: "TRANSCRIPT" },             // resets gotText/sawTurnActivity
     // Normal turn lifecycle for the second (current) utterance.
     { type: "COMPONENT" },

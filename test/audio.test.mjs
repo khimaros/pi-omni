@@ -57,7 +57,7 @@ test("suspended context: waits for 'running' statechange before settle", async (
 });
 
 test("interrupted context: waits for 'running' statechange before settle", async () => {
-  // The actual mobile regression — playChime once only checked
+  // The actual mobile regression -- playChime once only checked
   // "suspended". On Firefox Android the context can be "interrupted",
   // and resume() may transition slowly (or back to interrupted).
   // We must observe the statechange before scheduling.

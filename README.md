@@ -1,18 +1,23 @@
 # pi-omni
 
-push-to-talk voice extension for [pi.dev](https://pi.dev): wires a local
+standalone **web voice server** for [pi.dev](https://pi.dev): a browser-based
+voice chat UI backed by a real pi-coding-agent session, wired to a local
 OpenAI-compatible STT/LLM/TTS stack (e.g. [llama-swap](https://github.com/mostlygeek/llama-swap)
-serving whisper.cpp + llama.cpp + a TTS model) into a pi agent session, plus
-an optional browser UI.
+serving whisper.cpp + llama.cpp + a TTS model).
+
+speak in the browser; pi-omni transcribes (STT), runs the turn through pi's
+agent loop and tools (LLM), and speaks the reply back (TTS). each browser tab
+gets its own pi session.
+
+> in-TUI voice (push-to-talk and continuous voice rendered inside the pi
+> terminal, no browser) lives in the separate **pi-live** package.
 
 ## getting started
 
 prerequisites:
 
-- node.js 20+
+- node.js 20+ (the server compiles to dist/ via tsc; the extension stays .ts)
 - a working pi installation
-- `arecord` (alsa-utils) and a wav-on-stdin speaker (`aplay`, `paplay`,
-  `ffplay -nodisp -autoexit -`, …)
 - an OpenAI-compatible endpoint exposing STT, LLM, and TTS
 
 install as a pi extension:
@@ -21,110 +26,81 @@ install as a pi extension:
 pi install npm:@khimaros/pi-omni
 ```
 
-control voice mode from the pi tui:
+control the web voice server from the pi tui:
 
 ```bash
-> /omni              # push-to-talk: tap to record, VAD or re-tap to stop
-> /omni-live         # continuous conversation: record → STT → LLM → TTS loop
-> /omni-cancel       # cancel any active recording / TTS / chat loop
-> /omni-setup        # configure endpoint, models, mic, speaker (re-run anytime)
-> /omni-test [text]  # TTS round-trip diagnostic
+> /omni              # interactive picker (start / status / stop / open)
+> /omni start        # start the server (optionally: /omni start <host:port>)
+> /omni status       # show the listen address
+> /omni stop         # stop the server
+> /omni open         # open the web voice app in a browser
 ```
 
-control the web UI from the pi tui:
+or auto-start when pi launches (owned by pi, terminated when pi exits):
 
 ```bash
-> /omni-web start    # start the web server
-> /omni-web status   # view server status
-> /omni-web open     # open the web UI in browser
-> /omni-web stop     # stop the web server
+pi --omni                       # start on launch
+pi --omni-listen 0.0.0.0:4962   # custom bind address (implies --omni)
 ```
 
-or auto-start when pi launches (terminated when pi exits):
-
-```bash
-pi --omni-live       # continuous voice on launch
-pi --omni-web        # web server on launch
-```
-
-run the web server standalone (no pi tui). pi-coding-agent is an optional peer
-(the pi tui already provides it), so install it alongside pi-omni for the
-standalone path:
+run the server standalone (no pi tui, outlives pi). pi-coding-agent is an
+optional peer (the pi tui already provides it), so install it alongside for the
+standalone path, or `make install` to put the `pi-omni` command on PATH:
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent @khimaros/pi-omni
-PI_VOICE_LLM_MODEL=qwen3-32b pi-omni-web
+PI_VOICE_LLM_MODEL=qwen3-32b pi-omni --listen 127.0.0.1:4962
 ```
 
-then open <http://127.0.0.1:4962>.
-
-Once loaded, the Web UI automatically tracks active sessions. You can use the premium glassmorphic **sessions** menu in the top-right corner to view a list of recent sessions, switch between them, or start a new session instantly. Reconnecting after a WebSocket disconnect or reloading the page automatically resumes the active session based on the URL hash.
+the server prints `base_url=http://host:port` once listening; open that URL.
 
 ### pwa installation
 
-the web UI is a Progressive Web App (PWA). you can "install" it to your home screen or desktop for a native-like experience:
-1. open the URL in a supported browser (Chrome, Safari, Edge).
-2. look for the "Install" icon in the address bar or select "Add to Home Screen" from the browser menu.
-3. the app will appear on your device with a premium waveform icon.
-
+the web UI is a Progressive Web App (PWA). open the URL in a supported browser
+and choose "Install" / "Add to Home Screen" for a native-like experience.
 
 ### from a source checkout
 
 ```bash
-make            # install deps + build
-make test       # run tests
+make            # install deps + compile the server to dist/ (tsc)
+make start      # run the server
+make test       # build + run tests
+make test-integration  # black-box python e2e against fake-openai
 make wasm       # rebuild wasm/apm (after touching wasm/apm/src/)
 ```
 
 ## configuration
 
-first run of `/omni` triggers `/omni-setup` automatically — it walks
-through endpoint, models, mic, speaker, and an end-to-end round-trip test.
-saved to `~/.pi/extensions/omni.json`. re-run `/omni-setup` anytime to
-reconfigure.
-
-env vars override the saved file:
+the OpenAI-compatible endpoint and STT/TTS models come from env vars (overriding
+the saved `~/.pi/extensions/omni.json`):
 
 | variable | default | purpose |
 | --- | --- | --- |
-| `PI_VOICE_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible endpoint |
+| `PI_VOICE_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible endpoint (STT + TTS) |
 | `PI_VOICE_API_KEY` | `sk-no-key` | llama-swap usually ignores it |
 | `PI_VOICE_STT_MODEL` | `whisper-1` | as exposed by your server |
 | `PI_VOICE_TTS_MODEL` | `tts-1` | |
 | `PI_VOICE_TTS_VOICE` | `alloy` | |
-| `PI_VOICE_LLM_MODEL` | _(none)_ | required for standalone `pi-omni-web` |
-| `PI_VOICE_MIC_DEVICE` | _(default ALSA)_ | passed to `arecord -D` |
-| `PI_VOICE_SPEAKER_CMD` | `aplay -q ...` | reads WAV from stdin |
-| `PI_VOICE_AEC_ENABLED` | `false` | acoustic echo cancellation (WebRTC AEC3 WASM) |
-| `PI_VOICE_AEC_DELAY_MS` | `200` | expected speaker→mic round-trip |
-| `PI_VOICE_BARGE_IN` | `false` | keep mic open during TTS, cut in on speech |
-| `PI_VOICE_BARGE_IN_MIN_MS` | `300` | minimum speech duration to count as barge-in |
-| `PI_VOICE_WEB_HOST` | `127.0.0.1` | http bind address for the web server |
-| `PI_VOICE_WEB_PORT` | `4962` | http port for the web server |
+| `PI_VOICE_LLM_MODEL` | _(none)_ | default model for the standalone server |
+| `PI_OMNI_LISTEN` | `127.0.0.1:4962` | http bind address (`host:port`, `:port`, or `port`) |
 
-cli flags for the pi extension:
+the LLM runs through pi-coding-agent (and any installed pi extensions), so it
+uses pi's configured providers/models; the OpenAI-compatible endpoint above is
+used only for STT and TTS.
 
-| flag | env var | config key | effect |
-| --- | --- | --- | --- |
-| `--omni-live` | `PI_OMNI_AUTO_LIVE=true` | `autoStartLive` | start continuous voice on launch |
-| `--omni-web` | `PI_OMNI_AUTO_WEB=true` | `autoStartWeb` | start web server on launch |
-
-cli flags for standalone `pi-omni-web`:
+cli flags:
 
 | flag | purpose |
 | --- | --- |
-| `--listen <host:port>` | http bind address; takes precedence over env vars |
+| `--listen <host:port>` | bind address; takes precedence over `PI_OMNI_LISTEN` |
 | `-h`, `--help` | usage |
 
 ## echo cancellation & barge-in
 
-set `aecEnabled: true` and `bargeInEnabled: true` (via `/omni-setup` or env)
-to keep the mic open during TTS so you can interrupt by speaking. without
-AEC, only enable barge-in on headphones — speaker output will feed back into
-the mic and the bot will interrupt itself.
-
-the AEC is a Rust port of WebRTC AEC3 compiled to WASM, depended on as a
-`file:` package at `wasm/apm/pkg/`. rebuild after touching `wasm/apm/src/`:
+the browser client can keep the mic open during TTS and cut in on speech
+(barge-in), using an acoustic echo canceller -- a Rust port of WebRTC AEC3
+compiled to WASM, depended on as a `file:` package at `wasm/apm/pkg/`. rebuild
+after touching `wasm/apm/src/`:
 
 ```bash
 make wasm
@@ -135,48 +111,38 @@ cd wasm/apm && wasm-pack build --target nodejs --release
 build deps: `rustup` (e.g. via `mise use -g rust@latest`) with the
 `wasm32-unknown-unknown` target, plus `wasm-pack`.
 
-## roadmap
-
-see [ROADMAP.md](ROADMAP.md) for implemented and planned features.
-
 ## architecture
 
 ```
 src/
-  extension/   pi extension entry (commands, shortcuts, event handlers)
-  server/      HTTP + WS server hosting the browser client
-  bin/         standalone executables (pi-omni-web)
-  audio/       mic, STT, TTS, VAD, AEC, sentence chunker, sanitizer
+  extension/   pi extension entry -- spawns the bin, handshakes on base_url=; .ts
+  server/      HTTP + WS voice server hosting the pi sdk runtime, compiled to dist/
+                 index.ts (standalone entrypoint), http.ts, session.ts,
+                 turn-lifecycle.ts
+  audio/       STT, TTS, VAD, AEC, sentence chunker, sanitizer (shared with
+                 pi-live, which keeps its own copy)
   config.ts    shared config + env-var overrides
-public/        browser client (no build step)
-wasm/apm/      WebRTC AEC3 → WASM (rust)
-test/          node --test files
+public/        browser client (vanilla js, no build step)
+wasm/apm/      WebRTC AEC3 -> WASM (rust)
+test/          node --test files (.mjs) + python e2e (fake_openai_test.py)
 ```
+
+the server compiles to `dist/` (the bin runs under plain node, which will not
+type-strip `.ts` under `node_modules/`); the extension stays `.ts` and is loaded by
+pi's jiti loader.
 
 ## development
 
 ```bash
-make            # install deps + build (tsc)
-make test       # build then run node --test
+make            # install deps + compile the server to dist/ (tsc)
+make start      # run the server
+make test       # build + run tests
+make test-integration  # black-box python e2e against fake-openai
 make lint       # type-check (tsc --noEmit)
-make precommit  # lint + test
-make install    # install globally from this checkout
-make update     # npm update
+make precommit  # lint + test + test-integration
+make install    # install the pi-omni command globally (onto PATH)
 make wasm       # rebuild wasm/apm
 make pack       # npm pack into build/
 make publish    # npm publish --access public
-make clean      # rm -rf dist build
+make clean      # rm -rf build
 ```
-
-## known limits
-
-- sentence chunking is naive (split on `.!?\n`); abbreviations like "e.g."
-  will split early.
-- manual barge-in via `/omni` re-tap works without AEC; automatic barge-in
-  needs AEC enabled or headphones.
-- if the pi extension bus doesn't forward `message_update`, TTS waits for
-  `turn_end` — still works, just less interactive.
-- barge-in cuts off TTS instantly but the LLM keeps generating in the
-  background until it finishes; its output is discarded.
-- standalone `pi-omni-web` requires `PI_VOICE_LLM_MODEL`; the pi extension
-  path doesn't (pi owns the LLM).

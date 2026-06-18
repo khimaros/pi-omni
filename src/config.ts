@@ -5,6 +5,12 @@ import type { VoiceConfig } from "./audio/loop.js";
 
 export const CONFIG_PATH = join(homedir(), ".pi", "extensions", "omni.json");
 
+// default web listen address, used when neither --listen nor PI_OMNI_LISTEN nor
+// the config file sets one. a single host:port spec, matching the flag/env.
+export const DEFAULT_HOST = "127.0.0.1";
+export const DEFAULT_PORT = 4962;
+export const LISTEN_ENV = "PI_OMNI_LISTEN";
+
 const DEFAULT_VOICE_SYSTEM_PROMPT =
   "You are a concise local voice assistant. " +
   "Your reply will be spoken aloud by a text-to-speech engine, so never use " +

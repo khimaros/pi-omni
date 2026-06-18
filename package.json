@@ -1,6 +1,6 @@
 {
   "name": "@khimaros/pi-omni",
-  "version": "0.20.1",
+  "version": "0.21.0",
   "description": "realtime voice chat with pi.dev",
   "keywords": [
     "pi-package"
@@ -15,30 +15,29 @@
     "url": "https://github.com/khimaros/pi-omni/issues"
   },
   "type": "module",
-  "main": "dist/extension/index.js",
-  "exports": {
-    ".": "./dist/extension/index.js"
-  },
+  "main": "dist/server/index.js",
   "bin": {
-    "pi-omni-web": "dist/bin/pi-omni-web.js"
+    "pi-omni": "dist/server/index.js"
   },
   "pi": {
     "extensions": [
-      "dist/extension/index.js"
+      "src/extension/index.ts"
     ]
   },
   "files": [
     "dist",
+    "src/extension",
     "public",
     "wasm/apm/pkg",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc && node -e \"require('fs').chmodSync('dist/bin/pi-omni-web.js', 0o755)\"",
+    "build": "tsc && node -e \"require('fs').chmodSync('dist/server/index.js', 0o755)\"",
+    "typecheck": "tsc --noEmit",
     "prepack": "npm run build",
-    "start": "node dist/bin/pi-omni-web.js",
-    "test": "node --test test/*.test.mjs"
+    "start": "node dist/server/index.js",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "publishConfig": {
     "access": "public"
@@ -47,7 +46,7 @@
     "node": ">=20"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.6"
+    "@earendil-works/pi-coding-agent": "^0.75.3"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
@@ -66,7 +65,7 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.6",
+    "@earendil-works/pi-coding-agent": "^0.75.3",
     "@types/node": "^20.11.0",
     "@types/ws": "^8.18.1",
     "typescript": "^5.4.0"

@@ -13,14 +13,14 @@ console.log(`samples_per_frame = ${N}`);
 
 // Pre-roll the delay line: 200ms = 20 frames of zeros for the mic path
 const DELAY_FRAMES = (DELAY_MS * SR) / 1000 / N; // 20 frames
-const TOTAL_FRAMES = 400; // 4 seconds — give AEC3 time to converge
+const TOTAL_FRAMES = 400; // 4 seconds -- give AEC3 time to converge
 const ref = new Float32Array(N);
 const mic = new Float32Array(N);
 
 const refRing = []; // queue of past reference frames for echo simulation
 const energies = []; // [(in, out)] per frame
 
-// White noise — broadband, decorrelated, what AEC3 is tuned for.
+// White noise -- broadband, decorrelated, what AEC3 is tuned for.
 const rand = () => (Math.random() * 2 - 1) * 0.3;
 
 for (let f = 0; f < TOTAL_FRAMES; f++) {

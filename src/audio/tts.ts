@@ -46,12 +46,12 @@ export type TtsOptions = {
   speed?: number;
   instructions?: string;
   language?: string;
-  // When false, don't request stream_format=sse — the endpoint returns the
+  // When false, don't request stream_format=sse -- the endpoint returns the
   // whole PCM body in one response. Useful for TTS servers that don't speak
   // SSE; trades first-audio latency for compatibility.
   streamAudio?: boolean;
   // Silence (ms) inserted between consecutive sentences in drain(). Only
-  // fires when 2+ sentences are queued back-to-back — single-sentence turns
+  // fires when 2+ sentences are queued back-to-back -- single-sentence turns
   // (block mode) never trigger it. 0 disables.
   interSentenceGapMs?: number;
   logger?: TtsLogger;
@@ -108,7 +108,7 @@ export class TtsPlayer {
     }
   }
 
-  // One-shot synth+play used by /omni-test. Doesn't share the drain player —
+  // One-shot synth+play used by /omni-test. Doesn't share the drain player --
   // spawns its own, writes a single sentence, closes stdin, waits.
   async speakOnce(text: string): Promise<TtsDiag> {
     const ac = new AbortController();
@@ -140,7 +140,7 @@ export class TtsPlayer {
         .join(" ")
         .trim();
       this.opts.logger?.(
-        `tts: player exit=${close.code} sig=${close.signal}${tail ? ` — ${tail}` : ""}`,
+        `tts: player exit=${close.code} sig=${close.signal}${tail ? ` -- ${tail}` : ""}`,
         "warning",
       );
     }
@@ -179,7 +179,7 @@ export class TtsPlayer {
           }
         } else if ((this.opts.interSentenceGapMs ?? 0) > 0) {
           // Each sentence is synthesized as an independent TTS call, so the
-          // next one starts with no prosodic lead-in from the previous —
+          // next one starts with no prosodic lead-in from the previous --
           // they run together. Insert a brief pad of silence to restore the
           // natural pause at a sentence boundary.
           this.writeSilence(player, this.opts.interSentenceGapMs ?? 0);
@@ -192,7 +192,7 @@ export class TtsPlayer {
           player,
           this.inflight,
         );
-        // synth_end + play_end fire when SSE is done for this sentence —
+        // synth_end + play_end fire when SSE is done for this sentence --
         // audio may still be playing from the player's buffer, but at the
         // producer level we're handing off to the next sentence now.
         this.onPhase("synth_end", {
@@ -232,7 +232,7 @@ export class TtsPlayer {
             .join(" ")
             .trim();
           this.opts.logger?.(
-            `tts: player exit=${close.code} sig=${close.signal}${tail ? ` — ${tail}` : ""}`,
+            `tts: player exit=${close.code} sig=${close.signal}${tail ? ` -- ${tail}` : ""}`,
             "warning",
           );
         }
@@ -240,7 +240,7 @@ export class TtsPlayer {
       }
       this.busy = false;
       // If a new sentence landed while we were awaiting player.closed above,
-      // enqueue()'s drain() call saw busy=true and bailed — pick it up now.
+      // enqueue()'s drain() call saw busy=true and bailed -- pick it up now.
       // Skip the "drained" signal in that case so we don't flap tts_end →
       // tts_start on the client between sentences.
       if (this.queue.length && !this.cancelled) {
@@ -302,7 +302,7 @@ export class TtsPlayer {
 
   // Open the SSE stream for one sentence and pipe decoded PCM into the
   // supplied player. Returns once the stream completes (NOT once the audio
-  // finishes playing — that's the player's exit).
+  // finishes playing -- that's the player's exit).
   private async synthIntoPlayer(
     text: string,
     queued: number,

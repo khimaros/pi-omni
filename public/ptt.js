@@ -4,7 +4,7 @@
 //
 // Lifecycle (open mic, chime, close mic, etc.) lives in app.js's
 // openMicLifecycle / closeMicLifecycle so PTT and live share the same
-// orchestration. consumeHadAudio() reads and clears the flag — call it
+// orchestration. consumeHadAudio() reads and clears the flag -- call it
 // AFTER flush() runs (driven by the WS_FLUSH_PTT action that follows
 // CLOSE_PTT in the RELEASE reducer output) so the snapshot reflects the
 // post-flush value, not the pre-flush default of false.

@@ -14,7 +14,7 @@ export class SentenceChunker {
     let lastIdx = 0;
     while ((m = re.exec(this.buf)) !== null) {
       // exec with /g skips forward when the regex can't match at lastIdx
-      // (e.g. "Node.js" — the dot before "js" isn't a sentence terminator,
+      // (e.g. "Node.js" -- the dot before "js" isn't a sentence terminator,
       // so the engine jumps ahead to the next valid match). Slice from
       // lastIdx to capture that skipped text as part of THIS sentence,
       // otherwise it gets silently dropped from the TTS stream.

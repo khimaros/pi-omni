@@ -1,4 +1,4 @@
-// Packaging regression tests for the standalone `pi-omni-web` bin.
+// Packaging regression tests for the standalone `pi-omni` bin.
 //
 // The deploy flow (persona VM, see ../persona/server/incant-user.sh) installs
 // pi-coding-agent at the global top level first, then `npm -g install`s the
@@ -16,7 +16,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const BIN_ENTRY = resolve(ROOT, "dist/bin/pi-omni-web.js");
+const BIN_ENTRY = resolve(ROOT, "dist/server/index.js");
 const PI_AGENT = "@earendil-works/pi-coding-agent";
 
 const IMPORT_RE = /\b(?:import|export)\b[^'"]*?\bfrom\s*['"]([^'"]+)['"]/g;

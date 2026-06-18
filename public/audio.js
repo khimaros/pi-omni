@@ -3,10 +3,10 @@
 
 // Bring an AudioContext back to the "running" state before scheduling
 // playback. Mobile browsers can park the context in "suspended" or
-// "interrupted" — in either state, scheduled oscillators silently
+// "interrupted" -- in either state, scheduled oscillators silently
 // no-op. Per MDN, calling resume() from "interrupted" may transition
 // back to "interrupted" instead of "running", so just awaiting the
-// resume() Promise is not enough — we have to actually observe a
+// resume() Promise is not enough -- we have to actually observe a
 // statechange to "running". Time out after `runningTimeoutMs` to avoid
 // hanging if the OS refuses to wake the engine.
 //
